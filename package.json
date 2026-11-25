@@ -1,0 +1,45 @@
+{
+  "name": "@zhyx91/docwen-dsh",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DocWen document workflows for DeepSeek Harness",
+  "main": "./dist/host.js",
+  "exports": {
+    ".": "./dist/host.js",
+    "./client": "./dist/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist/host.js",
+    "dist/client.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "engines": {
+    "dsh": "0.2.3-alpha.2",
+    "node": "^24.22.3 || >=26.13.1"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "check": "tsc --noEmit",
+    "test": "esbuild test/workflows.test.ts --bundle --platform=node --format=esm --outfile=dist/workflows.test.mjs && node --test dist/workflows.test.mjs",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.3",
+    "@types/react": "18.3.32",
+    "esbuild": "0.28.2",
+    "fflate": "0.8.3",
+    "mdast-util-from-markdown": "2.1.0",
+    "typescript": "7.0.2"
+  }
+}
