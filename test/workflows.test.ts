@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { test } from 'node:test'
@@ -83,6 +83,9 @@ test('collects a Markdown bundle with relative media and detects tampering befor
     const result = await collectBundle(bundle, 'task', staging, output, MARKDOWN, signal)
     assert.equal(result.primary, 'main')
     const bytes = await readResultFile(output, result.files[0], signal)
+    const linkedOutput = path.join(root, 'linked-result')
+    await symlink(output, linkedOutput, process.platform === 'win32' ? 'junction' : 'dir')
+    assert.deepEqual(await readResultFile(linkedOutput, result.files[0], signal), bytes)
     assert.deepEqual(sections(bytes.toString()).map(section => section.title), ['First', 'Second'])
     assert.equal(sections(bytes.toString())[1].markdown, '# Second\n\nPick only this.')
     await writeFile(path.join(output, 'images', 'file.png'), 'bad')

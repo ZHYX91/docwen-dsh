@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { mkdir, mkdtemp, readdir, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { zipSync } from 'fflate'
@@ -82,8 +82,10 @@ export function apply(ctx: Host): void {
     const signal = AbortSignal.any([request.signal, disposed.signal, AbortSignal.timeout(5 * 60 * 1000)])
     const scope = await ctx.workspaceFiles.scopeOf(sessionId, signal)
     if (!scope) throw new Error('The conversation is not available.')
-    const destination = resultRoot(sessionId)
+    await mkdir(data, { recursive: true, mode: 0o700 })
+    const destination = path.join(await realpath(data), hash(sessionId))
     await mkdir(destination, { recursive: true, mode: 0o700 })
+    if (await realpath(destination) !== destination) throw new Error('The session result folder is redirected.')
     const work = await mkdtemp(path.join(destination, '.staging-'))
     let safeToClean = true
     try {

@@ -197,7 +197,8 @@ export async function collectBundle(
 }
 
 export async function readResultFile(root: string, file: ResultFile, signal: AbortSignal): Promise<Buffer> {
-  const locator = await fileWithin(await realpath(root), path.resolve(root, portablePath(file.path)))
+  const physicalRoot = await realpath(root)
+  const locator = await fileWithin(physicalRoot, path.resolve(physicalRoot, portablePath(file.path)))
   const bytes = await readLimited(locator, file.bytes, signal)
   if (bytes.length !== file.bytes || hash(bytes) !== file.sha256) throw new Error('The saved file has changed or is incomplete.')
   return bytes
