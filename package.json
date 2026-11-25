@@ -4,6 +4,11 @@
   "private": true,
   "type": "module",
   "description": "DocWen document workflows for DeepSeek Harness",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ZHYX91/docwen-dsh.git"
+  },
+  "keywords": ["dsh-plugin", "deepseek-harness", "docwen"],
   "main": "./dist/host.js",
   "exports": {
     ".": "./dist/host.js",
@@ -13,8 +18,10 @@
   "files": [
     "dist/host.js",
     "dist/client.js",
+    "dist/THIRD-PARTY-NOTICES.txt",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "README.zh-CN.md"
   ],
   "engines": {
     "dsh": "0.2.3-alpha.2",
@@ -32,7 +39,7 @@
     "build": "node scripts/build.mjs",
     "check": "tsc --noEmit",
     "test": "esbuild test/workflows.test.ts --bundle --platform=node --format=esm --outfile=dist/workflows.test.mjs && node --test dist/workflows.test.mjs",
-    "prepack": "npm run build"
+    "prepare": "node scripts/build.mjs"
   },
   "devDependencies": {
     "@types/node": "24.19.3",
