@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feat/**", "fix/**", "chore/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify (Node 26.13.1 / ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26.13.1
+          cache: npm
+      - name: Install locked dependencies and build package
+        run: npm ci
+      - name: Type check
+        run: npm run check
+      - name: Unit and protocol tests
+        run: npm test
+      - name: Verify distributable package
+        run: npm pack --dry-run
