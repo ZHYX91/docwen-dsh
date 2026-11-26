@@ -255,29 +255,6 @@ for (const mode of ['ok', 'fail', 'cancel'] as const)
     }
   })
 
-test('handles the DSH web bridge origin and requires an explicit same-host mutation', async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'docwen-bridge-'))
-  const { service } = harness(root, 'ok')
-  try {
-    const { routeHandler } = await import('../src/host.js')
-    const dispatch = routeHandler(service)
-    const request = (origin: string, marker = '1') =>
-      new Request('http://dsh.internal/api/docwen-dsh?sessionId=s&action=cancel', {
-        method: 'POST',
-        headers: { host: '127.0.0.1:4180', origin, 'x-docwen-dsh': marker },
-        body: JSON.stringify({ taskId: randomUUID() }),
-      })
-    const accepted = await dispatch(request('http://127.0.0.1:4180'))
-    assert.equal(accepted.status, 200)
-    assert.deepEqual(await accepted.json(), { ok: false })
-    assert.equal((await dispatch(request('http://localhost:4190'))).status, 403)
-    assert.equal((await dispatch(request('http://127.0.0.1:4180', ''))).status, 403)
-  } finally {
-    await service.dispose()
-    await rm(root, { recursive: true, force: true })
-  }
-})
-
 test('archives verified members under their original relative names, with no successful partial ZIP', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'docwen-archive-'))
   const { service } = harness(root, 'ok')
@@ -320,6 +297,29 @@ test('archives verified members under their original relative names, with no suc
     const controller = new AbortController()
     controller.abort()
     assert.equal((await dispatch(new Request(endpoint, { signal: controller.signal }))).status, 499)
+  } finally {
+    await service.dispose()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('handles the DSH web bridge origin and requires an explicit same-host mutation', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'docwen-bridge-'))
+  const { service } = harness(root, 'ok')
+  try {
+    const { routeHandler } = await import('../src/host.js')
+    const dispatch = routeHandler(service)
+    const request = (origin: string, marker = '1') =>
+      new Request('http://dsh.internal/api/docwen-dsh?sessionId=s&action=cancel', {
+        method: 'POST',
+        headers: { host: '127.0.0.1:4180', origin, 'x-docwen-dsh': marker },
+        body: JSON.stringify({ taskId: randomUUID() }),
+      })
+    const accepted = await dispatch(request('http://127.0.0.1:4180'))
+    assert.equal(accepted.status, 200)
+    assert.deepEqual(await accepted.json(), { ok: false })
+    assert.equal((await dispatch(request('http://localhost:4190'))).status, 403)
+    assert.equal((await dispatch(request('http://127.0.0.1:4180', ''))).status, 403)
   } finally {
     await service.dispose()
     await rm(root, { recursive: true, force: true })
