@@ -16,7 +16,7 @@ test('finds only the selected completed reply and the attachments already availa
     { type: 'assistant/message', surfaceOp: 'append', data: { message: {
       id: 'reply1', content: [{ type: 'reasoning', text: 'private' }, { type: 'text', text: '## Original reply' }],
     } } },
-    { type: 'turn/end' },
+    { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
     { type: 'turn/start' },
     { type: 'assistant/message', surfaceOp: 'append', data: { message: {
       id: 'reply2', content: [{ type: 'text', text: 'Incomplete reply' }],
@@ -36,25 +36,24 @@ test('selects inline and reference-style images but leaves code and ordinary lin
 })
 
 test('selects an immutable conversation image and a bounded workspace image independently', async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'docwen-images-'))
-  const workspace = path.join(root, 'workspace')
+  const scope = { workspaceRoot: '/projects/current', sessionId: 'session' }
   const signal = new AbortController().signal
-  try {
-    await mkdir(workspace)
-    await writeFile(path.join(workspace, 'workspace.png'), Buffer.from('workspace'))
-    await writeFile(path.join(root, 'other.png'), Buffer.from('other'))
-    const store = {
-      imageHostPath: () => path.join(root, 'attachment.png'),
-      readImage: async () => ({ data: Buffer.from('stored') }),
-    }
-    const refs = [{ attachmentId: 'stored', mediaType: 'image/png', bytes: 6 }]
-    const actual = await replyImages('![Stored](dsh-attachment:stored)\n![Workspace](workspace.png)', refs, store, workspace, 'session', signal)
-    assert.deepEqual(actual.map(image => Buffer.from(image.bytes).toString()), ['stored', 'workspace'])
-    await assert.rejects(replyImages('![](../other.png)', refs, store, workspace, 'session', signal), /Cannot read/)
-    await assert.rejects(replyImages('![](https://example.com/remote.png)', refs, store, workspace, 'session', signal), /not an available/)
-  } finally {
-    await rm(root, { recursive: true, force: true })
+  const store = {
+    imageHostPath: () => '/attachments/example.png',
+    readImage: async () => ({ data: Buffer.from('stored') }),
   }
+  const bytes = Buffer.from('workspace')
+  const stat = { absolutePath: '/projects/current/workspace.png', version: 'one', bytes: bytes.length }
+  const files = {
+    scopeOf: async () => scope,
+    stat: async (_scope: typeof scope, file: string) => { assert.equal(file, stat.absolutePath); return stat },
+    readBytes: async () => ({ ...stat, offset: 0, eof: true, data: bytes }),
+  }
+  const refs = [{ attachmentId: 'stored', mediaType: 'image/png', bytes: 6 }]
+  const actual = await replyImages('![Stored](dsh-attachment:stored)\n![Workspace](workspace.png)', refs, store, files, scope, signal)
+  assert.deepEqual(actual.map(image => Buffer.from(image.bytes).toString()), ['stored', 'workspace'])
+  await assert.rejects(replyImages('![](../other.png)', refs, store, files, scope, signal), /Cannot read/)
+  await assert.rejects(replyImages('![](https://example.com/remote.png)', refs, store, files, scope, signal), /not an available/)
 })
 
 test('collects a Markdown bundle with relative media and detects tampering before serving it', async () => {
@@ -69,16 +68,16 @@ test('collects a Markdown bundle with relative media and detects tampering befor
     await writeFile(path.join(staging, 'main.md'), source)
     await writeFile(path.join(staging, 'photo.png'), 'png')
     const artifacts = [
-      { artifact_id: 'main', kind: 'document', locator: 'main.md', logical_path: 'main.md',
+      { artifact_id: 'main', kind: 'document', suggested_name: 'main.md', locator: 'main.md', logical_path: 'main.md',
         media_type: MARKDOWN, size_bytes: Buffer.byteLength(source), sha256: hash(source) },
-      { artifact_id: 'img', kind: 'resource', locator: 'photo.png', logical_path: 'images/file.png',
+      { artifact_id: 'img', kind: 'resource', suggested_name: 'file.png', locator: 'photo.png', logical_path: 'images/file.png',
         media_type: 'image/png', size_bytes: 3, sha256: hash('png') },
     ]
     const bundle = {
-      task_id: 'task', schema: 'docwen.artifact_bundle.v3', layout_schema: 'docwen.artifact_layout.v1',
-      producer: { name: 'DocWen', machine_protocol: 'docwen.machine.v2' }, artifacts,
-      entries: [{ artifact_id: 'main', role: 'primary', preferred: true }],
-      relations: [{ type: 'resource_of', source_artifact_id: 'img', target_artifact_id: 'main' }],
+      bundle_id: 'bundle.test', task_id: 'task', schema: 'docwen.artifact_bundle.v3', layout_schema: 'docwen.artifact_layout.v1',
+      producer: { name: 'DocWen', product_version: '0.23.2', machine_protocol: 'docwen.machine.v2' }, artifacts,
+      entries: [{ artifact_id: 'main', role: 'primary', ordinal: 0, preferred: true }],
+      relations: [{ type: 'resource_of', role: 'image', source_artifact_id: 'img', target_artifact_id: 'main' }],
     }
     const result = await collectBundle(bundle, 'task', staging, output, MARKDOWN, signal)
     assert.equal(result.primary, 'main')

@@ -35,3 +35,43 @@ jobs:
         run: npm test
       - name: Verify distributable package
         run: npm pack --dry-run
+      - name: Check out the supported DocWen Core baseline
+        uses: actions/checkout@v4
+        with:
+          repository: ZHYX91/docwen
+          ref: d06bdee5afb80f0df7f3bee78254a050eb205198
+          path: .acceptance/core
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: "0.12.0"
+          python-version: "3.12.13"
+          enable-cache: true
+          cache-dependency-glob: .acceptance/core/uv.lock
+      - name: Install locked Core and released DSH
+        shell: pwsh
+        run: |
+          uv sync --project .acceptance/core --frozen --no-dev
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm install --prefix "$env:RUNNER_TEMP/docwen-test-host" --no-audit --no-fund @deepseek-ai/dsh@0.2.3-alpha.2 pnpm@11.28.5
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "$env:RUNNER_TEMP/docwen-test-host/node_modules/.bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Install and exercise the packaged plugin in a disposable DSH profile
+        shell: pwsh
+        run: |
+          $env:DSH_BIN = "$env:RUNNER_TEMP/docwen-test-host/node_modules/@deepseek-ai/dsh/lib/bin.js"
+          $executable = if ($IsWindows) { 'Scripts/docwen.exe' } else { 'bin/docwen' }
+          $env:DOCWEN_DSH_EXECUTABLE = Join-Path "$PWD/.acceptance/core/.venv" $executable
+          node scripts/host-smoke.mjs
+      - name: Exercise the installed DSH session panel in Chromium
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ui="$RUNNER_TEMP/docwen-test-browser"
+          npm install --prefix "$ui" --no-audit --no-fund --save-exact playwright@1.62.1
+          "$ui/node_modules/.bin/playwright" install --with-deps chromium
+          export NODE_PATH="$ui/node_modules"
+          export DSH_BIN="$RUNNER_TEMP/docwen-test-host/node_modules/@deepseek-ai/dsh/lib/bin.js"
+          export DOCWEN_DSH_EXECUTABLE="$PWD/.acceptance/core/.venv/bin/docwen"
+          node scripts/browser-smoke.mjs

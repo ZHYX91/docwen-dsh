@@ -1,0 +1,3 @@
+- insert:
+    - id: docwen-test-history
+      name: '@docwen-test/session-history'
