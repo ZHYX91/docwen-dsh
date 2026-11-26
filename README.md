@@ -2,64 +2,70 @@
 
 [简体中文](README.zh-CN.md)
 
-DocWen DSH integrates an installed DocWen CLI with DeepSeek Harness. It uses
-DocWen Machine Protocol v2 and Artifact Bundle v3 to convert documents with
-local templates, proofreading rules, and resources.
+Export completed conversation replies, bring selected document sections into a draft, and run a local DocWen installation from Harness Web. The plugin uses Machine v2 and saves verified Artifact Bundle v3 results in the conversation that requested them.
 
-## Install the plugin
+## Install
 
-The supported development baseline is DeepSeek Harness Web
-`0.2.3-alpha.2` with DocWen CLI `0.23.2`. Use the Node version required by
-that Harness release. Install the DocWen CLI on the same machine as the
-Harness host. Make it available on the host's PATH or set
-`DOCWEN_DSH_EXECUTABLE` to the executable's absolute path before starting
-Harness. Install the plugin in the `web` profile from a prebuilt `.tgz`:
+Use DeepSeek Harness Web `0.2.3-alpha.2` and a local DocWen Machine v2 CLI (development baseline `0.23.2`). The Harness host and DocWen process must share a local filesystem. Install the CLI on the host's PATH or set `DOCWEN_DSH_EXECUTABLE` to its absolute executable path before starting Harness. A source-installed CLI commonly uses the executable name `docwen`.
 
-```sh
-dsh plugin --profile web add ./zhyx91-docwen-dsh-0.1.0.tgz
-dsh --profile web
-```
-
-To build that tarball from a source checkout:
+From the plugin source checkout, with a supported Node version (`^24.22.3 || >=26.13.1`):
 
 ```sh
 npm ci
 npm run check
 npm test
 npm pack
+dsh plugin --profile web add ./zhyx91-docwen-dsh-0.1.0.tgz
+dsh web
 ```
 
-The tarball includes license notices for the dependencies bundled into the plugin.
+The tarball includes the built host, browser client and bundled dependency notices. With Git access, you can also install an exact commit using `dsh plugin --profile web add git+https://github.com/ZHYX91/docwen-dsh.git#COMMIT_SHA`. Review the commit and allow only the install-time build key printed by DSH in that profile's `pnpm-workspace.yaml`.
 
-### Install from Git
+## Conversation workflows
 
-With Git access to the repository, replace `COMMIT_SHA` with the full commit
-ID you want to install:
+* Open **Export Word** under a completed assistant reply. Preview the original visible Markdown, select a Word template and choose the proofreading rules. To export several replies in one Word document, select the replies and order them in the **DocWen** session panel. Reasoning, incomplete responses and tool calls are excluded. Referenced session images and workspace raster files are embedded. A missing image stops the export.
+* In the panel, select a DOCX from your computer, workspace, attachments or a previous result and convert it to Markdown. Download the whole result as a ZIP to retain relative image links. Open a section, review it and choose **Add section to draft**. You control when to send that draft.
+* Reopen the session panel to access earlier results, download an individual file or the complete group, or remove a saved result. A completed output stays readable when the originating model turn ends. Uploading and processing a document does not send its content to a model.
 
-```sh
-dsh plugin --profile web add git+https://github.com/ZHYX91/docwen-dsh.git#COMMIT_SHA
+The workbench initially selects separate image files and standard Markdown image links for Word imports when Core offers those options. You can change either setting before importing.
+
+## File workbench
+
+Choose files first. The panel offers compatible operations reported by the installed Core. Options, templates, numbering schemes and optimizations come from the same installation. Depending on its capabilities, the workbench supports:
+
+| Workflow | Examples |
+|---|---|
+| Convert and extract | Word or spreadsheets to Markdown, Markdown to Word or spreadsheets, Markdown tables or workbook sheets to CSV, HTML/ENEX import, fixed-layout document and TIFF extraction |
+| Review or transform | Markdown proofreading report, heading numbering, or a copy of an existing DOCX with Word comments when the server advertises `validate.docx` |
+| Render, OCR and optimize | PDF page images, OCR on supported inputs, and document-to-Markdown optimization routes advertised by Core |
+| Merge and split | Ordered PDF merge, spreadsheet merge, images to TIFF, PDF page splits and specified page partitions |
+
+For a single-input operation, selecting several files creates a batch. Successes remain available if another row fails. Retry failed rows from the same panel. Multi-input operations receive files in the displayed order as one task. Mixed PDF/OFD/XPS merging uses a compatible native merge if available; otherwise it requires an advertised PDF conversion for every non-PDF input and a PDF merge. The baseline Core does not advertise the OFD/XPS-to-PDF steps. Private intermediate PDFs are never delivered. A failed or cancelled prerequisite stops the task.
+
+## Commands and model tools
+
+`/docwen` runs directly as a Harness command, including outside a model turn. Examples:
+
+```text
+/docwen help
+/docwen capabilities
+/docwen capabilities validate.markdown
+/docwen results
+/docwen export MESSAGE_ID
+/docwen process validate.docx
+/docwen run {"action":"process","capabilityId":"merge.pdf.documents","sources":[{"kind":"workspace","path":"first.pdf"},{"kind":"workspace","path":"second.pdf"}],"options":{}}
 ```
 
-This installation builds the plugin from source. Review the pinned source,
-then add only the exact key printed by DSH under `allowBuilds` in that
-profile's `pnpm-workspace.yaml` and retry. Use the prebuilt tarball to install
-without allowing an install-time build.
+Attach the input files to `/docwen process`. The separate `docwen` model tool can discover capabilities, run a selected operation, and refer to saved results by ID. A successful tool call in an open turn can present the primary file through Harness. The session panel retains the complete result group for all entry points.
 
-## Use DocWen in a conversation
+## Limits and lifecycle
 
-- Choose **Export Word** beneath a completed reply. DocWen uses the default
-  Word template and proofreading settings. Referenced raster images from
-  the conversation's attachments or the session workspace are embedded in
-  the Word file. An unavailable image stops the export with a message.
-- Open the **DocWen** section of the session panel and choose **Import Word**
-  to convert a local DOCX. Download the Markdown and its images together as
-  a ZIP, or review one section and use **Add section to draft**. Send the
-  draft from the composer when ready.
-- Download previous results from the same session panel. Results are
-  stored under `docwen-dsh` in the Harness home directory.
+One active document task per session, up to four across the host. Each task has a five-minute deadline. Inputs are limited to 64 files, 32 MiB per file and 96 MiB in total. Source previews are capped at 2 MiB. Reordering, cancellation and per-item retries apply to the current batch; after a browser restart, local uploads must be selected again. Closing a live session or unloading the plugin cancels its active work. Completed results remain under `docwen-dsh` in `DSH_HOME` (default `~/.dsh`) until removed. A private staging directory is retained if subprocess exit cannot be confirmed.
 
-This development build covers local Harness Web sessions and the two
-document workflows above. Markdown image references use the session
-workspace or stored conversation images. The import accepts DOCX files up
-to 32 MiB. Conversions run through DocWen Machine Protocol v2 and publish
-the verified Artifact Bundle v3 result.
+Session workspace files use the Harness file service. The plugin verifies their resolved workspace identity before use. Session attachments are resolved from trusted Harness references. File identities, sizes and SHA-256 hashes are checked when saving results and again before delivery. The published file list and the ZIP preserve the Bundle's logical paths.
+
+## Verifying an installed package
+
+After `npm ci`, set `DSH_BIN` to the installed `@deepseek-ai/dsh/lib/bin.js` and `DOCWEN_DSH_EXECUTABLE` to the absolute path of the Core CLI. Run `node scripts/host-smoke.mjs`. It packs the plugin, installs it into a temporary Web profile, and checks a completed reply, two distinct image sources, Word and Markdown downloads, a fork, session isolation, cancellation, the slash command and native tool delivery. The fixture supplies the historical turn. An online model account is unnecessary.
+
+For the browser test, install Playwright and its matching Chromium in the test environment and run `node scripts/browser-smoke.mjs`. The CI workflow records the exact host, Core, browser and runner setup.

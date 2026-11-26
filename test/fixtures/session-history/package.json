@@ -1,0 +1,9 @@
+{
+  "name": "@docwen-test/session-history",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./index.mjs",
+  "engines": { "dsh": "0.2.3-alpha.2" },
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
+}

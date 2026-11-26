@@ -1,234 +1,278 @@
 import { randomUUID } from 'node:crypto'
-import { mkdir, mkdtemp, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { zipSync } from 'fflate'
-import { completedReply, replyImages, type ImageStore } from './history.js'
-import {
-  collectBundle, hash, IMAGE_TYPES, MAX_DOCUMENT, portablePath, readResult, readResultFile, sections,
-  snapshot, type Result,
-} from './documents.js'
-import { DOCX, EXPORT, IMPORT, MARKDOWN, object, runMachine, UnconfirmedExit, type ManagedProcess } from './machine.js'
+import { IMAGE_MEDIA, MAX_DOCUMENT, MAX_RESULT, readResultFile, sections } from './documents.js'
+import { registerEntries, type EntryHost } from './entries.js'
+import { IMPORT, MARKDOWN, object, text } from './machine.js'
+import { ResultStore, sessionKey } from './result-store.js'
+import { Busy, DocumentTasks, type OpenInput, type TaskPorts } from './tasks.js'
 
 const route = '/api/docwen-dsh'
-const identifier = /^[A-Za-z0-9._:-]{1,180}$/u
-const resultId = /^[0-9a-f-]{36}$/u
 const noCache = { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' }
-
-type Json = Record<string, unknown>
-interface Host {
+const json = (value: unknown, status = 200) => Response.json(value, { status, headers: noCache })
+interface Host extends TaskPorts {
   connection: {
     fetch: {
-      register(definition: {
+      register(def: {
         path: string
         methods: ('GET' | 'POST')[]
         requestBody: 'buffered' | 'streaming'
-        fetch: (request: Request) => Promise<Response>
+        fetch: (r: Request) => Promise<Response>
       }): () => Promise<void>
     }
   }
-  sessionQuery: { readSession(sessionId: string): Promise<{ events: Json[] } | undefined> }
-  workspaceFiles: { scopeOf(sessionId: string, signal: AbortSignal): Promise<{ workspaceRoot: string } | undefined> }
-  attachments: ImageStore
-  subprocess: {
-    resolveExecutable(command: string, env: undefined, signal: AbortSignal): Promise<string>
-    spawn(spec: { argv: string[]; cwd: string; stdio: { stdin: 'pipe'; stdout: 'pipe'; stderr: 'pipe' }; graceMs: number }): ManagedProcess
-  }
   effect(callback: () => () => Promise<void>, label: string): unknown
+  inject: EntryHost['inject']
+  on: EntryHost['on'] & ((event: 'session/disposed', handler: (session: { id: string }) => void) => unknown)
 }
 
 export const name = 'docwen-dsh'
 export const inject = ['connection', 'sessionQuery', 'workspaceFiles', 'attachments', 'subprocess']
 
-function reply(value: unknown, status = 200): Response {
-  return Response.json(value, { status, headers: noCache })
-}
-
-function parameter(query: URLSearchParams, key: string): string {
-  const value = query.get(key) ?? ''
-  if (!identifier.test(value)) throw new Error(`Invalid ${key}.`)
-  return value
-}
-
-async function bodyBytes(request: Request, limit: number): Promise<Buffer> {
+class TooLarge extends Error {}
+async function bodyBytes(request: Request, limit: number, signal: AbortSignal): Promise<Buffer> {
+  signal.throwIfAborted()
+  if (Number(request.headers.get('content-length') ?? 0) > limit)
+    throw new TooLarge('The request exceeds the file size limit.')
   const reader = request.body?.getReader()
-  if (!reader) throw new Error('The request did not supply a file.')
-  const chunks: Uint8Array[] = []
+  if (!reader) throw new Error('The request contains no input.')
+  const buffers: Uint8Array[] = []
   let bytes = 0
+  const cancel = () => {
+    void reader.cancel().catch(() => {})
+  }
+  signal.addEventListener('abort', cancel, { once: true })
   try {
     while (true) {
-      request.signal.throwIfAborted()
-      const chunk = await reader.read()
-      if (chunk.done) break
-      bytes += chunk.value.byteLength
-      if (bytes > limit) throw new Error('The request exceeds DocWen DSH’s file size limit.')
-      chunks.push(chunk.value)
+      const item = await reader.read()
+      signal.throwIfAborted()
+      if (item.done) break
+      bytes += item.value.length
+      if (bytes > limit) throw new TooLarge('The request exceeds the file size limit.')
+      buffers.push(item.value)
     }
+    return Buffer.concat(buffers)
   } finally {
-    await reader.cancel().catch(() => undefined)
+    signal.removeEventListener('abort', cancel)
+    await reader.cancel().catch(() => {})
+    reader.releaseLock()
   }
-  return Buffer.concat(chunks)
+}
+const parseJSON = (bytes: Uint8Array) =>
+  object(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)))
+const maxJSON = 256 * 1024
+
+async function taskInput(r: Request, query: URLSearchParams, signal: AbortSignal): Promise<OpenInput> {
+  const action = query.get('action')
+  if (action === 'export') {
+    const { proofread } = parseJSON(await bodyBytes(r, 2048, signal))
+    if (typeof proofread !== 'boolean') throw new Error('Choose whether to proofread the exported document.')
+    return {
+      intent: {
+        action: 'export',
+        messageIds: [query.get('messageId')],
+        options: proofread ? { proofread: {} } : {},
+      },
+    }
+  }
+  if (action === 'import') {
+    const filename = query.get('filename') ?? ''
+    if (!/\.docx$/iu.test(filename)) throw new Error('Choose a .docx file.')
+    const data = await bodyBytes(r, MAX_DOCUMENT, signal)
+    return {
+      uploads: new Map([['file0', new File([new Uint8Array(data)], filename)]]),
+      intent: {
+        action: 'process',
+        capabilityId: IMPORT,
+        sources: [{ kind: 'upload', field: 'file0' }],
+        options: {
+          preserve_resources: true,
+          image_mode: 'file',
+          image_link_style: 'markdown_embed',
+          recognize_text: false,
+        },
+      },
+    }
+  }
+  const contentType = r.headers.get('content-type') ?? ''
+  if (!contentType.toLowerCase().startsWith('multipart/form-data'))
+    return { intent: parseJSON(await bodyBytes(r, maxJSON, signal)) }
+  const bytes = await bodyBytes(r, MAX_RESULT + 1024 * 1024, signal)
+  const form = await new Response(new Uint8Array(bytes), {
+    headers: { 'Content-Type': contentType },
+  }).formData()
+  const value = form.get('intent')
+  if (typeof value !== 'string' || Buffer.byteLength(value) > maxJSON || form.getAll('intent').length !== 1)
+    throw new Error('Missing or invalid file operation.')
+  const uploads = new Map<string, File>()
+  for (const [key, file] of form) {
+    if (key === 'intent') continue
+    if (
+      !/^file\d{1,2}$/u.test(key) ||
+      typeof file === 'string' ||
+      uploads.has(key) ||
+      file.size > MAX_DOCUMENT ||
+      uploads.size >= 64
+    )
+      throw new Error('Invalid or oversized file upload.')
+    uploads.set(key, file)
+  }
+  return { intent: object(JSON.parse(value)), uploads }
 }
 
-export function apply(ctx: Host): void {
-  const home = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
-  const data = path.resolve(home, 'docwen-dsh')
-  const executable = process.env.DOCWEN_DSH_EXECUTABLE || (process.platform === 'win32' ? 'DocWenCLI.exe' : 'DocWenCLI')
-  const disposed = new AbortController()
-  const active = new Map<string, Promise<Result>>()
-  const resultRoot = (sessionId: string) => path.join(data, hash(sessionId))
+function bitmap(bytes: Uint8Array, media: string) {
+  const b = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  if (media === 'image/png') return b.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+  if (media === 'image/jpeg') return b[0] === 255 && b[1] === 216 && b[2] === 255
+  if (media === 'image/gif') return /^GIF8[79]a/u.test(b.toString('ascii', 0, 6))
+  if (media === 'image/bmp') return b.toString('ascii', 0, 2) === 'BM'
+  return (
+    media === 'image/webp' && b.toString('ascii', 0, 4) === 'RIFF' && b.toString('ascii', 8, 12) === 'WEBP'
+  )
+}
+function binary(bytes: Uint8Array, media: string, name: string, inline = false) {
+  const filename = encodeURIComponent(path.posix.basename(name)).replace(
+    /['()*]/g,
+    (c) => '%' + c.charCodeAt(0).toString(16),
+  )
+  return new Response(new Uint8Array(bytes), {
+    headers: {
+      ...noCache,
+      'Content-Security-Policy': "default-src 'none'; sandbox",
+      'Content-Type': media,
+      'Content-Disposition': `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${filename}`,
+    },
+  })
+}
 
-  async function convert(request: Request, query: URLSearchParams, sessionId: string, operation: 'export' | 'import'): Promise<Result> {
-    const signal = AbortSignal.any([request.signal, disposed.signal, AbortSignal.timeout(5 * 60 * 1000)])
-    const scope = await ctx.workspaceFiles.scopeOf(sessionId, signal)
-    if (!scope) throw new Error('The conversation is not available.')
-    await mkdir(data, { recursive: true, mode: 0o700 })
-    const destination = path.join(await realpath(data), hash(sessionId))
-    await mkdir(destination, { recursive: true, mode: 0o700 })
-    if (await realpath(destination) !== destination) throw new Error('The session result folder is redirected.')
-    const work = await mkdtemp(path.join(destination, '.staging-'))
-    let safeToClean = true
+export function routeHandler(tasks: DocumentTasks) {
+  return async (request: Request): Promise<Response> => {
     try {
-      const inputRoot = path.join(work, 'input')
-      const staging = path.join(work, 'engine')
-      const published = path.join(work, 'result')
-      const filesRoot = path.join(published, 'files')
-      await Promise.all([mkdir(inputRoot), mkdir(staging), mkdir(filesRoot, { recursive: true })])
-      const inputs = []
-      let label: string
-      let options: Json
-      if (operation === 'export') {
-        const messageId = parameter(query, 'messageId')
-        const body = object(JSON.parse((await bodyBytes(request, 2048)).toString('utf8')))
-        if (typeof body.proofread !== 'boolean') throw new Error('Choose whether to proofread the exported document.')
-        const session = await ctx.sessionQuery.readSession(sessionId)
-        if (!session) throw new Error('The conversation is not available.')
-        const { markdown, refs } = completedReply(session.events, messageId)
-        const source = Buffer.from(markdown)
-        if (source.length > MAX_DOCUMENT) throw new Error('The reply exceeds the document size limit.')
-        label = 'Conversation reply'
-        inputs.push(await snapshot(inputRoot, source, 'Conversation reply.md', MARKDOWN, 'source'))
-        options = body.proofread ? { proofread: {} } : {}
-        const images = await replyImages(markdown, refs, ctx.attachments, scope.workspaceRoot, sessionId, signal)
-        if (images.length) {
-          const bindings = []
-          for (const [index, image] of images.entries()) {
-            const extension = Object.keys(IMAGE_TYPES).find(key => IMAGE_TYPES[key] === image.media)
-            const logicalPath = `images/image-${index + 1}${extension}`
-            bindings.push({ authored_token: image.token, logical_path: logicalPath })
-            inputs.push(await snapshot(inputRoot, image.bytes, logicalPath, image.media, 'linked_resource'))
+      const url = new URL(request.url),
+        query = url.searchParams
+      const id = query.get('sessionId') ?? '',
+        action = query.get('action'),
+        signal = request.signal
+      if (!sessionKey.test(id)) return json({ error: 'Invalid session identity.' }, 400)
+      if (request.method === 'POST') {
+        if (request.headers.get('x-docwen-dsh') !== '1')
+          return json({ error: 'Invalid document request.' }, 403)
+        const origin = request.headers.get('origin')
+        if (origin && origin !== url.origin) {
+          // The DSH web bridge keeps the admitted HTTP Host but uses a synthetic URL.
+          const browser = URL.canParse(origin) ? new URL(origin) : undefined
+          if (
+            url.origin !== 'http://dsh.internal' ||
+            !browser ||
+            !['http:', 'https:'].includes(browser.protocol) ||
+            browser.origin !== origin ||
+            browser.host !== request.headers.get('host')
+          ) {
+            return json({ error: 'This document request belongs to another origin.' }, 403)
           }
-          options.markdown_resource_bindings = { authored_sha256: hash(source), images: bindings }
         }
-      } else {
-        label = portablePath(query.get('filename'))
-        if (label.includes('/') || !label.toLowerCase().endsWith('.docx')) throw new Error('Choose a .docx file.')
-        const source = await bodyBytes(request, MAX_DOCUMENT)
-        if (source.length < 4 || !source.subarray(0, 4).equals(Buffer.from([80, 75, 3, 4]))) {
-          throw new Error('The upload is not a Word document.')
+        if (action === 'cancel' || action === 'delete') {
+          await tasks.scope(id, signal)
+          const body = parseJSON(await bodyBytes(request, 2048, signal))
+          if (action === 'cancel') return json({ ok: tasks.cancel(id, text(body.taskId)) })
+          await tasks.store.remove(id, text(body.resultId))
+          return json({ ok: true })
         }
-        inputs.push(await snapshot(inputRoot, source, label, DOCX, 'source'))
-        options = { preserve_resources: true, image_mode: 'file', image_link_style: 'markdown_embed', recognize_text: false }
+        if (!['run', 'export', 'import'].includes(action ?? ''))
+          return json({ error: 'Unknown document operation.' }, 400)
+        const upload =
+          action === 'import' ||
+          (request.headers.get('content-type') ?? '').toLowerCase().startsWith('multipart/form-data')
+        if (upload !== url.pathname.endsWith('/upload'))
+          return json({ error: 'The operation was sent to the wrong route.' }, 400)
+        return json(
+          await tasks.submit(id, query.get('taskId') ?? randomUUID(), signal, (s) =>
+            taskInput(request, query, s),
+          ),
+        )
       }
-      signal.throwIfAborted()
-      const binary = await ctx.subprocess.resolveExecutable(executable, undefined, signal)
-      const child = ctx.subprocess.spawn({
-        argv: [binary, 'serve', '--stdio'], cwd: work, graceMs: 3000,
-        stdio: { stdin: 'pipe', stdout: 'pipe', stderr: 'pipe' },
-      })
-      const terminal = await runMachine(child, operation === 'export' ? EXPORT : IMPORT, inputs, staging, options, signal)
-      const bundle = await collectBundle(terminal.bundle, terminal.taskId, staging, filesRoot, operation === 'export' ? DOCX : MARKDOWN, signal)
-      const result: Result = {
-        ...bundle, id: randomUUID(), label, created: new Date().toISOString(),
-        warnings: terminal.diagnostics.flatMap(item =>
-          (item.severity === 'warning' || item.code === 'POSTPROCESS_PROOFREAD_SKIPPED') &&
-          typeof item.message === 'string' ? [item.message] : []),
+      if (request.method !== 'GET') return json({ error: 'Unsupported method.' }, 405)
+      if (action === 'catalog') return json(await tasks.catalog(id, signal))
+      if (action === 'list') return json(await tasks.list(id, signal))
+      if (action === 'attachments') return json(await tasks.attachments(id, signal))
+      if (action === 'preview') return json(await tasks.preview(id, text(query.get('messageId')), signal))
+      if (action === 'source-preview') {
+        const item = await tasks.previewSource(id, Object.fromEntries(query), signal)
+        if (IMAGE_MEDIA.has(item.media) && bitmap(item.bytes, item.media))
+          return binary(item.bytes, item.media, item.name, true)
+        if (item.media !== MARKDOWN && item.media !== 'text/plain')
+          return json({ error: 'Preview supports Markdown, text and raster images.' }, 415)
+        return new Response(new TextDecoder('utf-8', { fatal: true }).decode(item.bytes), {
+          headers: { ...noCache, 'Content-Type': 'text/plain; charset=utf-8' },
+        })
       }
-      await writeFile(path.join(published, 'result.json'), JSON.stringify(result), { flag: 'wx' })
-      signal.throwIfAborted()
-      await rename(published, path.join(destination, result.id))
-      return result
+      await tasks.scope(id, signal)
+      if (action === 'active') return json(tasks.active(id))
+      if (!['file', 'archive', 'sections'].includes(action ?? ''))
+        return json({ error: 'Unknown result operation.' }, 400)
+      const { result, files } = await tasks.store.get(id, text(query.get('resultId')))
+      if (action === 'archive') {
+        const archive: Record<string, Uint8Array> = Object.create(null)
+        for (const file of result.files) archive[file.path] = await readResultFile(files, file, signal)
+        return binary(zipSync(archive, { level: 0 }), 'application/zip', 'docwen-result.zip')
+      }
+      const file = result.files.find((f) => f.id === (query.get('artifactId') ?? result.primary))
+      if (!file) return json({ error: 'Result file not found.' }, 404)
+      const bytes = await readResultFile(files, file, signal)
+      if (action === 'sections')
+        return file.media === MARKDOWN
+          ? json(sections(new TextDecoder('utf-8', { fatal: true }).decode(bytes)))
+          : json({ error: 'Choose a Markdown artifact.' }, 415)
+      return binary(bytes, file.media, file.path, query.get('inline') === '1' && bitmap(bytes, file.media))
     } catch (error) {
-      if (error instanceof UnconfirmedExit) safeToClean = false
-      throw error
-    } finally {
-      if (safeToClean) await rm(work, { recursive: true, force: true }).catch(() => undefined)
+      if (request.signal.aborted) return json({ error: 'The document request was cancelled.' }, 499)
+      if (error instanceof Busy) return json({ error: error.message }, 409)
+      if (error instanceof TooLarge) return json({ error: error.message }, 413)
+      const code = (error as NodeJS.ErrnoException)?.code
+      if (code === 'ENOENT')
+        return json({ error: 'The selected file, result or DocWen executable was not found.' }, 404)
+      if (code === 'EACCES' || code === 'EPERM')
+        return json({ error: 'The host denied access to a selected file or document service.' }, 403)
+      if (code && typeof code === 'string')
+        return json({ error: 'The host could not complete the document operation.' }, 422)
+      return json(
+        {
+          error:
+            error instanceof SyntaxError
+              ? 'Invalid document request.'
+              : error instanceof Error
+                ? error.message
+                : 'The document operation failed.',
+        },
+        422,
+      )
     }
   }
+}
 
-  const fetchResult = async (request: Request): Promise<Response> => {
-      try {
-        const query = new URL(request.url).searchParams
-        const sessionId = parameter(query, 'sessionId')
-        const action = query.get('action')
-        if (request.method === 'POST') {
-          if (action !== 'export' && action !== 'import') return reply({ error: 'Unknown document operation.' }, 400)
-          if ((action === 'import') !== new URL(request.url).pathname.endsWith('/upload')) {
-            return reply({ error: 'The document operation was sent to the wrong route.' }, 400)
-          }
-          if (request.headers.get('x-docwen-dsh') !== '1') return reply({ error: 'Invalid document request.' }, 403)
-          const size = Number(request.headers.get('content-length') ?? 0)
-          if (size > (action === 'export' ? 2048 : MAX_DOCUMENT)) return reply({ error: 'File is too large.' }, 413)
-          if (active.has(sessionId)) return reply({ error: 'This conversation already has a running document operation.' }, 409)
-          const task = convert(request, query, sessionId, action)
-          active.set(sessionId, task)
-          try {
-            return reply(await task)
-          } finally {
-            active.delete(sessionId)
-          }
-        }
-        const scope = await ctx.workspaceFiles.scopeOf(sessionId, request.signal)
-        if (!scope) return reply({ error: 'Conversation not found.' }, 404)
-        const root = resultRoot(sessionId)
-        if (action === 'list') {
-          const names = await readdir(root).catch((error: NodeJS.ErrnoException) => {
-            if (error.code === 'ENOENT') return []
-            throw error
-          })
-          const results = await Promise.all(names.filter(id => resultId.test(id)).map(id => readResult(path.join(root, id, 'result.json'))))
-          return reply(results.sort((a, b) => b.created.localeCompare(a.created)))
-        }
-        if (!['file', 'sections', 'archive'].includes(action ?? '')) return reply({ error: 'Unknown result action.' }, 400)
-        const id = query.get('resultId') ?? ''
-        if (!resultId.test(id)) return reply({ error: 'Result not found.' }, 404)
-        const result = await readResult(path.join(root, id, 'result.json'))
-        const filesRoot = path.join(root, id, 'files')
-        if (action === 'archive') {
-          const files: Record<string, Uint8Array> = Object.create(null)
-          for (const file of result.files) files[file.path] = await readResultFile(filesRoot, file, request.signal)
-          return new Response(new Uint8Array(zipSync(files, { level: 0 })), {
-            headers: { ...noCache, 'Content-Type': 'application/zip', 'Content-Disposition': 'attachment; filename="docwen-result.zip"' },
-          })
-        }
-        const file = result.files.find(item => item.id === (action === 'sections' ? result.primary : query.get('artifactId')))
-        if (!file) return reply({ error: 'Result file not found.' }, 404)
-        const bytes = await readResultFile(filesRoot, file, request.signal)
-        if (action === 'sections') {
-          if (file.media !== MARKDOWN) return reply({ error: 'This result has no Markdown sections.' }, 415)
-          return reply(sections(new TextDecoder('utf-8', { fatal: true }).decode(bytes)))
-        }
-        const name = encodeURIComponent(path.posix.basename(file.path)).replace(/['()]/g, value => `%${value.charCodeAt(0).toString(16)}`)
-        const presentation = query.get('inline') === '1' && file.media.startsWith('image/') ? 'inline' : 'attachment'
-        return new Response(new Uint8Array(bytes), {
-          headers: { ...noCache, 'Content-Type': file.media, 'Content-Disposition': `${presentation}; filename*=UTF-8''${name}` },
-        })
-      } catch (error) {
-        if (request.signal.aborted) return reply({ error: 'The document operation was cancelled.' }, 499)
-        const missing = (error as NodeJS.ErrnoException).code === 'ENOENT'
-        const message = missing ? 'A requested file or DocWen CLI could not be found.' : error instanceof Error ? error.message : 'The document operation failed.'
-        return reply({ error: message }, missing ? 404 : 422)
-      }
-  }
-  const unregister = ctx.connection.fetch.register({
-    path: route, methods: ['GET', 'POST'], requestBody: 'buffered', fetch: fetchResult,
-  })
-  const unregisterUpload = ctx.connection.fetch.register({
-    path: `${route}/upload`, methods: ['POST'], requestBody: 'streaming', fetch: fetchResult,
-  })
-  ctx.effect(() => async () => {
-    disposed.abort()
-    await Promise.allSettled(active.values())
-    await Promise.all([unregister(), unregisterUpload()])
-  }, 'docwen-dsh: stop active document operations and release routes')
+export function apply(ctx: Host) {
+  const home = path.resolve(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'))
+  const executable =
+    process.env.DOCWEN_DSH_EXECUTABLE || (process.platform === 'win32' ? 'DocWenCLI.exe' : 'DocWenCLI')
+  const tasks = new DocumentTasks(ctx, new ResultStore(home), executable)
+  registerEntries(ctx, tasks)
+  ctx.on('session/disposed', (session) => tasks.closeSession(session.id))
+  const fetch = routeHandler(tasks)
+  const unregister = [
+    ctx.connection.fetch.register({ path: route, methods: ['GET', 'POST'], requestBody: 'buffered', fetch }),
+    ctx.connection.fetch.register({
+      path: route + '/upload',
+      methods: ['POST'],
+      requestBody: 'streaming',
+      fetch,
+    }),
+  ]
+  ctx.effect(
+    () => async () => {
+      await tasks.dispose()
+      await Promise.all(unregister.map((fn) => fn()))
+    },
+    'Stop DocWen tasks and release document routes',
+  )
 }

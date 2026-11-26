@@ -8,7 +8,11 @@
     "type": "git",
     "url": "git+https://github.com/ZHYX91/docwen-dsh.git"
   },
-  "keywords": ["dsh-plugin", "deepseek-harness", "docwen"],
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "docwen"
+  ],
   "main": "./dist/host.js",
   "exports": {
     ".": "./dist/host.js",
@@ -38,7 +42,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "check": "tsc --noEmit",
-    "test": "esbuild test/workflows.test.ts --bundle --platform=node --format=esm --outfile=dist/workflows.test.mjs && node --test dist/workflows.test.mjs",
+    "test": "node scripts/test.mjs",
     "prepare": "node scripts/build.mjs"
   },
   "devDependencies": {
