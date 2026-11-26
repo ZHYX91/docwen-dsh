@@ -6,6 +6,8 @@
 
 ## 安装
 
+DSH 安装插件时会调用 `pnpm`，请将其加入宿主的 PATH。此 DSH 版本的源码锁定 `pnpm@11.28.5`。
+
 使用 DeepSeek Harness Web `0.2.3-alpha.2` 和本地 DocWen Machine v2 CLI，开发基线为 `0.23.2`。Harness 宿主与 DocWen 进程须使用同一套本机文件系统。将 CLI 加入宿主的 PATH，或在启动 Harness 前把 `DOCWEN_DSH_EXECUTABLE` 设为可执行文件的绝对路径。通过源码安装的 CLI 通常叫 `docwen`。
 
 在插件源码目录，使用宿主支持的 Node 版本（`^24.22.3 || >=26.13.1`）执行：

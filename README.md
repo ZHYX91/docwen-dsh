@@ -6,6 +6,8 @@ Export completed conversation replies, bring selected document sections into a d
 
 ## Install
 
+The DSH plugin installer calls `pnpm`. Keep it on the same PATH as the host. The DSH source tree for this release pins `pnpm@11.28.5`.
+
 Use DeepSeek Harness Web `0.2.3-alpha.2` and a local DocWen Machine v2 CLI (development baseline `0.23.2`). The Harness host and DocWen process must share a local filesystem. Install the CLI on the host's PATH or set `DOCWEN_DSH_EXECUTABLE` to its absolute executable path before starting Harness. A source-installed CLI commonly uses the executable name `docwen`.
 
 From the plugin source checkout, with a supported Node version (`^24.22.3 || >=26.13.1`):

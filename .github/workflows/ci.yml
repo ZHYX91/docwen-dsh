@@ -53,7 +53,9 @@ jobs:
         run: |
           uv sync --project .acceptance/core --frozen --no-dev
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          npm install --prefix "$env:RUNNER_TEMP/docwen-test-host" --no-audit --no-fund @deepseek-ai/dsh@0.2.3-alpha.2
+          npm install --prefix "$env:RUNNER_TEMP/docwen-test-host" --no-audit --no-fund @deepseek-ai/dsh@0.2.3-alpha.2 pnpm@11.28.5
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "$env:RUNNER_TEMP/docwen-test-host/node_modules/.bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - name: Install and exercise the packaged plugin in a disposable DSH profile
         shell: pwsh
         run: |

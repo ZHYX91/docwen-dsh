@@ -23,6 +23,24 @@ async function openPanel(page) {
   await page.getByLabel('Local files').waitFor({ state: 'visible' })
 }
 
+async function runFromButton(page, sessionId, button) {
+  const matches = request => {
+    const url = new URL(request.url())
+    return request.method() === 'POST' && /^\/api\/docwen-dsh(?:\/upload)?$/.test(url.pathname)
+      && url.searchParams.get('action') === 'run' && url.searchParams.get('sessionId') === sessionId
+  }
+  // The UI should dispatch promptly; Core gets its own five-minute task deadline.
+  const [, response] = await Promise.all([
+    page.waitForRequest(matches),
+    page.waitForResponse(response => matches(response.request()), { timeout: 305000 }),
+    button.click(),
+  ])
+  const result = await response.json()
+  assert.ok(response.ok(), 'DocWen run returned HTTP ' + response.status() + ': ' + String(result.error ?? '').slice(0, 500))
+  assert.match(result.id, /^[a-zA-Z0-9_-]+$/, 'A completed task must return its saved result ID')
+  return result.id
+}
+
 async function downloadZip(page, link) {
   const [download] = await Promise.all([page.waitForEvent('download'), link.click()])
   assert.equal(await download.failure(), null, 'Browser download failed')
@@ -58,8 +76,8 @@ async function checkBrowser(host) {
     await dialog.getByText('Source Markdown and referenced images', { exact: true }).click()
     assert.match(await dialog.locator('pre').innerText(), /historic reply/i)
     await dialog.getByLabel('Template', { exact: true }).selectOption({ index: 1 })
-    await dialog.getByRole('button', { name: 'Export Word', exact: true }).click()
-    const exported = page.locator('[role=status] a[download]').filter({ hasText: /\.docx$/i })
+    const exportId = await runFromButton(page, host.sessionId, dialog.getByRole('button', { name: 'Export Word', exact: true }))
+    const exported = dialog.locator('[role=status] a[download][href*="resultId=' + exportId + '"]').filter({ hasText: /\.docx$/i })
     const docx = await downloadZip(page, exported)
     assert.equal(Object.keys(docx).filter(p => p.startsWith('word/media/')).length, 2)
     assert.match(strFromU8(docx['word/document.xml']), /historic reply/i)
@@ -78,8 +96,9 @@ async function checkBrowser(host) {
     await openPanel(page)
     await page.getByLabel('Local files').setInputFiles(host.docxPath)
     await page.getByRole('combobox', { name: /^Operation/ }).selectOption('convert.docx.to_markdown')
-    await page.getByRole('button', { name: 'Run', exact: true }).click()
-    const result = page.locator('li').filter({ has: page.locator(':scope > a[download]').filter({ hasText: /\.md$/i }) }).first()
+    const importId = await runFromButton(page, host.sessionId, page.getByRole('button', { name: 'Run', exact: true }))
+    const primary = page.locator(':scope > a[download][href*="resultId=' + importId + '"]').filter({ hasText: /\.md$/i })
+    const result = page.locator('li').filter({ has: primary }).first()
     await result.getByRole('button', { name: 'Open result' }).click()
     const archive = await downloadZip(page, result.getByRole('link', { name: /Download all files/ }))
     const mdPath = Object.keys(archive).find(p => /\.md$/i.test(p))
