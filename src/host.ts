@@ -209,6 +209,7 @@ export function routeHandler(tasks: DocumentTasks) {
       }
       await tasks.scope(id, signal)
       if (action === 'active') return json(tasks.active(id))
+      if (action === 'result') return json((await tasks.store.get(id, text(query.get('resultId')))).result)
       if (!['file', 'archive', 'sections'].includes(action ?? ''))
         return json({ error: 'Unknown result operation.' }, 400)
       const { result, files } = await tasks.store.get(id, text(query.get('resultId')))

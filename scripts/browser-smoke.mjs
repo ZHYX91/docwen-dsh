@@ -126,6 +126,56 @@ async function checkBrowser(host) {
     await result.getByText('Added to the conversation draft.').waitFor()
     assert.match(await editor.innerText(), /second section/i)
     assert.doesNotMatch(await editor.innerText(), /historic reply/i)
+    step = 'recovering a converted batch row after a lost response'
+    const original = await readFile(host.docxPath)
+    await page.getByLabel('Local files').setInputFiles([
+      {name: 'lost-reply.docx', mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', buffer: original},
+      {name: 'normal-reply.docx', mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', buffer: original},
+    ])
+    await page.getByRole('combobox', { name: /^Operation/ }).selectOption('convert.docx.to_markdown')
+    const posts = []
+    let reads = 0
+    const routePattern = url => /^\/api\/docwen-dsh(?:\/upload)?$/.test(url.pathname)
+      && url.searchParams.get('sessionId') === host.sessionId
+    const intercept = async route => {
+      const url = new URL(route.request().url())
+      const action = url.searchParams.get('action')
+      if (action === 'run' && route.request().method() === 'POST') {
+        const taskId = url.searchParams.get('taskId')
+        posts.push(taskId)
+        if (posts.length === 1) {
+          const response = await route.fetch({ timeout: 120000 })
+          assert.ok(response.ok(), 'Real Core must complete before the response is dropped')
+          assert.equal((await response.json()).id, taskId)
+          const durable = await (await host.request(host.uri('list'))).json()
+          assert.ok(durable.some(item => item.id === taskId))
+          return route.abort('failed')
+        }
+      }
+      if (action === 'result' && url.searchParams.get('resultId') === posts[0]) {
+        reads++
+        // The first read is unavailable too; the manual retry must recover the exact result.
+        if (reads === 1) return route.fulfill({ status: 503, json: { error: 'Unavailable during the test' } })
+      }
+      return route.continue()
+    }
+    const lost = page.getByRole('listitem').filter({ hasText: /lost-reply\.docx · / })
+    const normal = page.getByRole('listitem').filter({ hasText: /normal-reply\.docx · / })
+    await page.route(routePattern, intercept)
+    try {
+      await page.getByRole('button', { name: 'Run batch', exact: true }).click()
+      await lost.getByText(/Result not confirmed/).waitFor()
+      await normal.getByText(/Completed/).waitFor()
+      await page.getByRole('button', { name: 'Check and retry unfinished items', exact: true }).click()
+      await lost.getByText(/Completed/).waitFor()
+      assert.equal(posts.length, 2, 'No second POST for the recovered row or the already completed row')
+      assert.equal(reads, 2)
+      const durable = await (await host.request(host.uri('list'))).json()
+      assert.equal(durable.filter(item => posts.includes(item.id)).length, 2)
+      const exact = await host.request(host.uri('result', {resultId: posts[0]}))
+      assert.equal((await exact.json()).id, posts[0])
+    } finally { await page.unroute(routePattern, intercept) }
+    console.log('Browser: mixed batch recovered the exact saved result after reply loss without submitting another job.')
     const history = await host.rpc('session/events', { request: { address: { kind: 'session', sessionId: host.sessionId }, maxMessages: 40 } })
     assert.equal(history.hasMore, false)
     const events = history.records.map(record => record.event)

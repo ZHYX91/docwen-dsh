@@ -50,7 +50,7 @@ export interface Reply { id: string; label: string }
 export type Intent =
   | { action: 'export'; messageIds: string[]; options: Options }
   | { action: 'process'; capabilityId: string; options: Options; inputs: Item[] }
-export interface Job { label: string; intent: Intent; status: 'queued' | 'running' | 'done' | 'failed' | 'cancelled'; error?: string; resultId?: string }
+export interface Job { label: string; intent: Intent; status: 'queued' | 'running' | 'done' | 'failed' | 'uncertain' | 'cancelled'; error?: string; taskId?: string; resultId?: string }
 
 export { fileMedia } from './media.js'
 export function identifier(): string {
@@ -118,10 +118,13 @@ export function wireIntent(intent: Intent): { body: BodyInit; multipart: boolean
 export function api(sessionId: string, action: string, fields: Record<string, string> = {}, upload = false): string {
   return 'api/docwen-dsh' + (upload ? '/upload' : '') + '?' + new URLSearchParams({ ...fields, sessionId, action })
 }
+export class HttpFailure extends Error {
+  constructor(message: string, readonly status: number) { super(message) }
+}
 export async function json<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init)
   const data = await response.json()
-  if (!response.ok) throw new Error(typeof data.error === 'string' ? data.error : 'DocWen HTTP ' + response.status)
+  if (!response.ok) throw new HttpFailure(typeof data?.error === 'string' ? data.error : 'DocWen HTTP ' + response.status, response.status)
   return data as T
 }
 
