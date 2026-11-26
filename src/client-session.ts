@@ -24,6 +24,7 @@ export class SessionBinding {
   private listeners = new Set<() => void>()
   private state: State = { results: [], attachments: [], jobs: [], replies: [], active: null, running: false, stopping: false }
   private revision = 0
+  private resultSequence = 0
   private sequence = 0
   private disposed = false
   private lifecycle = new AbortController()
@@ -50,10 +51,12 @@ export class SessionBinding {
   }
   refreshResults = async (signal = this.lifecycle.signal) => {
     const revision = this.revision
+    const sequence = ++this.resultSequence
+    const isCurrent = () => !signal.aborted && revision === this.revision && sequence === this.resultSequence
     try {
       const results = await json<Result[]>(this.url('list'), { signal })
-      if (!signal.aborted && revision === this.revision) this.set({ results })
-    } catch (error) { if (!signal.aborted) this.set({ error: String(error) }) }
+      if (isCurrent()) this.set({ results })
+    } catch (error) { if (isCurrent()) this.set({ error: String(error) }) }
   }
   refreshAttachments = async (signal: AbortSignal) => {
     try {

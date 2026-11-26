@@ -121,3 +121,68 @@ test('Word imports select portable image output only when the installed Core sup
   assert.deepEqual(workbenchOptions({...docx, capability_id:'validate.markdown'}), {})
   assert.deepEqual(workbenchOptions({...docx, options_schema:{properties:{image_mode:{enum:['omit']}}}}), {})
 })
+
+test('a slow saved-results refresh cannot replace a newer successful refresh', async t => {
+  const old = delayed<Response>()
+  let requests = 0
+  t.mock.method(globalThis, 'fetch', async (address: string) => {
+    const query = new URL(address, 'http://test').searchParams
+    assert.equal(query.get('action'), 'list')
+    assert.equal(query.get('sessionId'), 'session')
+    return ++requests === 1 ? old.promise : Response.json([result('new')])
+  })
+  const binding = new SessionBinding('session')
+  const first = binding.refreshResults()
+  await binding.refreshResults()
+  assert.deepEqual(binding.snapshot().results.map(row => row.id), ['new'])
+  old.resolve(Response.json([result('old')]))
+  await first
+  assert.deepEqual(binding.snapshot().results.map(row => row.id), ['new'])
+})
+
+test('a superseded results error cannot appear after a newer refresh succeeds', async t => {
+  const old = delayed<Response>()
+  let requests = 0
+  t.mock.method(globalThis, 'fetch', async () =>
+    ++requests === 1 ? old.promise : Response.json([result('new')]))
+  const binding = new SessionBinding('session')
+  const first = binding.refreshResults()
+  await binding.refreshResults()
+  old.resolve(Response.json({ error: 'Old refresh failed' }, { status: 500 }))
+  await first
+  assert.equal(binding.snapshot().error, undefined)
+})
+
+test('saved-results refreshes cannot overwrite completed actions or reappear in a switched session', async t => {
+  const original = delayed<Response>()
+  const afterCompletion = delayed<Response>()
+  let firstLists = 0
+  t.mock.method(globalThis, 'fetch', async (address: string) => {
+    const query = new URL(address, 'http://test').searchParams
+    const session = query.get('sessionId')
+    const action = query.get('action')
+    if (session === 'one' && action === 'list') {
+      return ++firstLists === 1 ? original.promise : afterCompletion.promise
+    }
+    if (session === 'one' && action === 'run') return Response.json(result('finished'))
+    assert.equal(session, 'two')
+    assert.equal(action, 'list')
+    return Response.json([result('other-session')])
+  })
+  const first = new SessionBinding('one')
+  const startedBeforeAction = first.refreshResults()
+  await first.submit([exportJob('finished')])
+  original.resolve(Response.json([result('obsolete')]))
+  await startedBeforeAction
+  assert.deepEqual(first.snapshot().results.map(row => row.id), ['finished'])
+
+  const switchSignal = new AbortController()
+  const closingPanel = first.refreshResults(switchSignal.signal)
+  switchSignal.abort()
+  const second = new SessionBinding('two')
+  await second.refreshResults()
+  afterCompletion.resolve(Response.json([result('old-view')]))
+  await closingPanel
+  assert.deepEqual(first.snapshot().results.map(row => row.id), ['finished'])
+  assert.deepEqual(second.snapshot().results.map(row => row.id), ['other-session'])
+})
