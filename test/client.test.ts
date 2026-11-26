@@ -157,6 +157,7 @@ test('saved-results refreshes cannot overwrite completed actions or reappear in 
   const original = delayed<Response>()
   const afterCompletion = delayed<Response>()
   let firstLists = 0
+  let finishedId = ''
   t.mock.method(globalThis, 'fetch', async (address: string) => {
     const query = new URL(address, 'http://test').searchParams
     const session = query.get('sessionId')
@@ -164,7 +165,11 @@ test('saved-results refreshes cannot overwrite completed actions or reappear in 
     if (session === 'one' && action === 'list') {
       return ++firstLists === 1 ? original.promise : afterCompletion.promise
     }
-    if (session === 'one' && action === 'run') return Response.json(result('finished'))
+    if (session === 'one' && action === 'run') {
+      finishedId = query.get('taskId') ?? ''
+      assert.ok(finishedId)
+      return Response.json(result(finishedId))
+    }
     assert.equal(session, 'two')
     assert.equal(action, 'list')
     return Response.json([result('other-session')])
@@ -174,7 +179,7 @@ test('saved-results refreshes cannot overwrite completed actions or reappear in 
   await first.submit([exportJob('finished')])
   original.resolve(Response.json([result('obsolete')]))
   await startedBeforeAction
-  assert.deepEqual(first.snapshot().results.map(row => row.id), ['finished'])
+  assert.deepEqual(first.snapshot().results.map(row => row.id), [finishedId])
 
   const switchSignal = new AbortController()
   const closingPanel = first.refreshResults(switchSignal.signal)
@@ -183,6 +188,6 @@ test('saved-results refreshes cannot overwrite completed actions or reappear in 
   await second.refreshResults()
   afterCompletion.resolve(Response.json([result('old-view')]))
   await closingPanel
-  assert.deepEqual(first.snapshot().results.map(row => row.id), ['finished'])
+  assert.deepEqual(first.snapshot().results.map(row => row.id), [finishedId])
   assert.deepEqual(second.snapshot().results.map(row => row.id), ['other-session'])
 })
