@@ -58,7 +58,7 @@ For a single-input operation, selecting several files creates a batch. Successes
 /docwen run {"action":"process","capabilityId":"merge.pdf.documents","sources":[{"kind":"workspace","path":"first.pdf"},{"kind":"workspace","path":"second.pdf"}],"options":{}}
 ```
 
-Attach the input files to `/docwen process`. The separate `docwen` model tool can discover capabilities, run a selected operation, and refer to saved results by ID. A successful tool call in an open turn can present the primary file through Harness. The session panel retains the complete result group for all entry points.
+Attach the input files to `/docwen process`. The separate `docwen` model tool can discover capabilities, run a selected operation, and refer to saved results by ID. A successful tool call in an open turn can present the primary file through Harness. For a PDF split, it presents each independent PDF in order. The session panel retains the complete result group for all entry points; use its ZIP to keep Markdown and linked images together.
 
 ## Limits and lifecycle
 
