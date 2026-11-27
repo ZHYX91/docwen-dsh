@@ -116,7 +116,7 @@ function ExportAction({ binding, locale, messageId }: Scope & { messageId: strin
 }
 function statusText(job: Job, t: Text) {
   const statuses: Record<Job['status'], [string,string]> = { queued: ['Queued','等待中'], running: ['Running','处理中'],
-    done: ['Completed','已完成'], failed: ['Failed','失败'], cancelled: ['Cancelled','已取消'] }
+    done: ['Completed','已完成'], failed: ['Failed','失败'], uncertain: ['Result not confirmed','结果未确认'], cancelled: ['Cancelled','已取消'] }
   return t(...statuses[job.status])
 }
 function Download({ binding, result, file }: { binding: SessionBinding; result: Result; file: ResultFile }) {
@@ -220,8 +220,9 @@ function Panel({ binding, locale, inputActions }: View) {
     {busy && <p role="status">{t('Processing…','正在处理…')} <progress value={percent} max={100}/>{' '}
       <button type="button" disabled={state.stopping} onClick={() => void binding.cancel()}>{t('Cancel','取消')}</button></p>}
     {state.jobs.length > 0 && <div><ul>{state.jobs.map((job,i) => <li key={i}>{job.label} · {statusText(job,t)} {job.error}</li>)}</ul>
-      {state.jobs.some(j => j.status === 'failed') && <button type="button" disabled={busy}
-        onClick={() => void binding.submit(state.jobs,true)}>{t('Retry failed items','重试失败项')}</button>}</div>}
+      {state.jobs.some(j => j.status === 'failed' || j.status === 'uncertain') && <button type="button" disabled={busy}
+        onClick={() => void binding.submit(state.jobs,true)}>{state.jobs.some(j => j.status === 'uncertain') ? t('Check and retry unfinished items','核对并重试未完成项')
+          : t('Retry failed items','重试失败项')}</button>}</div>}
     {state.results.length > 0 && <><h4>{t('Saved results','已保存的结果')}</h4><ul>{state.results.map(result =>
       <ResultRow key={result.id} binding={binding} result={result} t={t} inputActions={inputActions}/>)}</ul></>}
   </div>
