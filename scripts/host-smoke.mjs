@@ -159,7 +159,7 @@ export async function withInstalledHost(options, callback) {
     await mkdir(workspace)
     await writeFile(path.join(workspace, 'figure.png'), Buffer.from(bluePng, 'base64'))
     const npm = await npmCli()
-    const tarball = options.tarball ?? (await pack(packageDir, root, npm))
+    const tarball = options.tarball ?? process.env.DOCWEN_DSH_TEST_PACKAGE ?? (await pack(packageDir, root, npm))
     const fixture = await pack(path.join(packageDir, 'test/fixtures/session-history'), root, npm)
     const env = {
       ...process.env,

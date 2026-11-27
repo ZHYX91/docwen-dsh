@@ -33,8 +33,14 @@ jobs:
         run: npm run check
       - name: Unit and protocol tests
         run: npm test
-      - name: Verify distributable package
-        run: npm pack --dry-run
+      - name: Pack and identify the exact plugin used by host checks
+        shell: pwsh
+        run: |
+          $package = npm pack --ignore-scripts --json --pack-destination "$env:RUNNER_TEMP" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $tarball = Join-Path $env:RUNNER_TEMP $package.filename
+          Get-FileHash -LiteralPath $tarball -Algorithm SHA256 | Format-List
+          "DOCWEN_DSH_TEST_PACKAGE=$tarball" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Verify and unpack published DocWen 0.23.2
         shell: pwsh
         run: |
