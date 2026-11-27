@@ -256,6 +256,54 @@ for (const mode of ['ok', 'fail', 'cancel'] as const)
     }
   })
 
+test('archives verified members under their original relative names, with no successful partial ZIP', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'docwen-archive-'))
+  const { service } = harness(root, 'ok')
+  try {
+    const { unzipSync } = await import('fflate')
+    const { routeHandler } = await import('../src/host.js')
+    const dispatch = routeHandler(service)
+    const id = randomUUID(), staged = await service.store.staging('s')
+    const md = Buffer.from('![synthetic](assets/图.png)\n')
+    const image = Buffer.from('synthetic asset bytes')
+    const members = [
+      { id: 'note', path: 'note.md', media: 'text/markdown', data: md },
+      { id: 'image', path: 'assets/图.png', media: 'image/png', data: image },
+    ]
+    const files = path.join(staged, 'files')
+    await mkdir(path.join(files, 'assets'), { recursive: true })
+    for (const member of members) await writeFile(path.join(files, member.path), member.data)
+    await service.store.publish('s', staged, {
+      id, label: 'Synthetic archive', primary: 'note', created: new Date().toISOString(), warnings: [],
+      files: members.map(({ data, ...member }) => ({ ...member, bytes: data.length, sha256: hash(data) })),
+    }, new AbortController().signal)
+    const endpoint = 'http://dsh.internal/api/docwen-dsh?sessionId=s&action=archive&resultId=' + id
+    const response = await dispatch(new Request(endpoint))
+    assert.equal(response.status, 200)
+    assert.equal(response.headers.get('Content-Type'), 'application/zip')
+    const zip = new Uint8Array(await response.arrayBuffer())
+    assert.equal(response.headers.get('Content-Length'), String(zip.length))
+    const entries = unzipSync(zip)
+    assert.deepEqual(Object.keys(entries), members.map(m => m.path))
+    for (const m of members) assert.deepEqual(Buffer.from(entries[m.path]), m.data)
+    const openDownload = await dispatch(new Request(endpoint))
+    const reader = openDownload.body!.getReader()
+    assert.equal((await reader.read()).done, false)
+    await reader.cancel()
+    const published = await service.store.get('s', id)
+    await writeFile(path.join(published.files, members[1].path), Buffer.alloc(image.length))
+    const corrupt = await dispatch(new Request(endpoint))
+    assert.equal(corrupt.status, 422)
+    assert.match((await corrupt.json()).error, /changed|incomplete/)
+    const controller = new AbortController()
+    controller.abort()
+    assert.equal((await dispatch(new Request(endpoint, { signal: controller.signal }))).status, 499)
+  } finally {
+    await service.dispose()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('handles the DSH web bridge origin and requires an explicit same-host mutation', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'docwen-bridge-'))
   const { service } = harness(root, 'ok')
