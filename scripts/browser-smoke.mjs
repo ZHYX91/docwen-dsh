@@ -187,6 +187,12 @@ async function checkBrowser(host) {
   } catch (error) {
     const alerts = page ? await page.locator('[role=alert]:visible').allTextContents().catch(() => []) : []
     if (alerts.length) console.error('Visible DSH errors:', alerts.join(' / ').slice(0, 500))
+    if (page && step === 'connecting to the installed DSH') {
+      const count = await page.locator('[data-row-key]').count().catch(() => 0)
+      const main = await page.locator('body').innerText({ timeout: 2000 }).catch(() => '')
+      const visible = main.replace(/((?:token|key|ticket|code)=)[^\s&#]+/gi, '$1[redacted]')
+      console.error('DSH startup view:', { rows: count, visible: visible.slice(0, 500) })
+    }
     throw new Error('Browser acceptance failed while ' + step + ': ' + String(error?.message ?? error)
       .replace(/((?:token|key|ticket|code)=)[^\s&#]+/gi, '$1[redacted]'))
   } finally { await browser.close() }
