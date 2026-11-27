@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
-import { zipSync } from 'fflate'
+import { Zip, ZipPassThrough } from 'fflate'
 import { IMAGE_MEDIA, MAX_DOCUMENT, MAX_RESULT, readResultFile, sections } from './documents.js'
 import { registerEntries, type EntryHost } from './entries.js'
 import { IMPORT, MARKDOWN, object, text } from './machine.js'
@@ -131,12 +131,12 @@ function bitmap(bytes: Uint8Array, media: string) {
     media === 'image/webp' && b.toString('ascii', 0, 4) === 'RIFF' && b.toString('ascii', 8, 12) === 'WEBP'
   )
 }
-function binary(bytes: Uint8Array, media: string, name: string, inline = false) {
+function binary(body: BodyInit, media: string, name: string, inline = false) {
   const filename = encodeURIComponent(path.posix.basename(name)).replace(
     /['()*]/g,
     (c) => '%' + c.charCodeAt(0).toString(16),
   )
-  return new Response(new Uint8Array(bytes), {
+  return new Response(body, {
     headers: {
       ...noCache,
       'Content-Security-Policy': "default-src 'none'; sandbox",
@@ -144,6 +144,45 @@ function binary(bytes: Uint8Array, media: string, name: string, inline = false) 
       'Content-Disposition': `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${filename}`,
     },
   })
+}
+
+async function archiveBody(root: string, files: Parameters<typeof readResultFile>[1][], signal: AbortSignal) {
+  const chunks: Uint8Array[] = []
+  const zip = new Zip((error, chunk) => {
+    if (error) throw error
+    if (chunk.byteLength) chunks.push(chunk)
+  })
+  try {
+    // Verify the complete group before committing an HTTP success. Stored ZIP entries
+    // pass the already verified member buffers through without concatenating them.
+    for (const file of files) {
+      signal.throwIfAborted()
+      const bytes = await readResultFile(root, file, signal)
+      const entry = new ZipPassThrough(file.path)
+      zip.add(entry)
+      entry.push(bytes, true)
+    }
+    signal.throwIfAborted()
+    zip.end()
+  } catch (error) {
+    zip.terminate()
+    throw error
+  }
+  const length = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0)
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (signal.aborted) {
+        chunks.length = 0
+        controller.error(signal.reason)
+        return
+      }
+      const next = chunks.shift()
+      if (next) controller.enqueue(next)
+      else controller.close()
+    },
+    cancel() { chunks.length = 0 },
+  })
+  return { stream, length }
 }
 
 export function routeHandler(tasks: DocumentTasks) {
@@ -200,7 +239,7 @@ export function routeHandler(tasks: DocumentTasks) {
       if (action === 'source-preview') {
         const item = await tasks.previewSource(id, Object.fromEntries(query), signal)
         if (IMAGE_MEDIA.has(item.media) && bitmap(item.bytes, item.media))
-          return binary(item.bytes, item.media, item.name, true)
+          return binary(new Uint8Array(item.bytes), item.media, item.name, true)
         if (item.media !== MARKDOWN && item.media !== 'text/plain')
           return json({ error: 'Preview supports Markdown, text and raster images.' }, 415)
         return new Response(new TextDecoder('utf-8', { fatal: true }).decode(item.bytes), {
@@ -209,13 +248,15 @@ export function routeHandler(tasks: DocumentTasks) {
       }
       await tasks.scope(id, signal)
       if (action === 'active') return json(tasks.active(id))
+      if (action === 'result') return json((await tasks.store.get(id, text(query.get('resultId')))).result)
       if (!['file', 'archive', 'sections'].includes(action ?? ''))
         return json({ error: 'Unknown result operation.' }, 400)
       const { result, files } = await tasks.store.get(id, text(query.get('resultId')))
       if (action === 'archive') {
-        const archive: Record<string, Uint8Array> = Object.create(null)
-        for (const file of result.files) archive[file.path] = await readResultFile(files, file, signal)
-        return binary(zipSync(archive, { level: 0 }), 'application/zip', 'docwen-result.zip')
+        const { stream, length } = await archiveBody(files, result.files, signal)
+        const response = binary(stream, 'application/zip', 'docwen-result.zip')
+        response.headers.set('Content-Length', String(length))
+        return response
       }
       const file = result.files.find((f) => f.id === (query.get('artifactId') ?? result.primary))
       if (!file) return json({ error: 'Result file not found.' }, 404)
@@ -224,7 +265,7 @@ export function routeHandler(tasks: DocumentTasks) {
         return file.media === MARKDOWN
           ? json(sections(new TextDecoder('utf-8', { fatal: true }).decode(bytes)))
           : json({ error: 'Choose a Markdown artifact.' }, 415)
-      return binary(bytes, file.media, file.path, query.get('inline') === '1' && bitmap(bytes, file.media))
+      return binary(new Uint8Array(bytes), file.media, file.path, query.get('inline') === '1' && bitmap(bytes, file.media))
     } catch (error) {
       if (request.signal.aborted) return json({ error: 'The document request was cancelled.' }, 499)
       if (error instanceof Busy) return json({ error: error.message }, 409)

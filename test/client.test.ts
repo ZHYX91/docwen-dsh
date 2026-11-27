@@ -51,19 +51,56 @@ function delayed<T>() {
 function result(id:string) { return {id, label:id, primary:'main', created:'2026-01-01', files:[], warnings:[]} }
 const exportJob = (id:string): Job => ({status:'queued',label:id,intent:{action:'export',messageIds:[id],options:{}}})
 test('retry sends only failed rows, keeps successful files and preserves chronological results', async t => {
-  const calls: string[] = []
-  t.mock.method(globalThis,'fetch',async (_url:string,init: RequestInit) => {
-    const id = JSON.parse(String(init.body)).messageIds[0]
-    calls.push(id)
-    if (id === 'one' && calls.length === 1) return Response.json({error:'failed'},{status:500})
-    return Response.json(result(id))
+  const calls: { label: string; taskId: string }[] = []
+  t.mock.method(globalThis,'fetch',async (address:string, init: RequestInit) => {
+    const query = new URL(address, 'http://test').searchParams
+    if (query.get('action') === 'result') return Response.json({error:'missing'},{status:404})
+    const label = JSON.parse(String(init.body)).messageIds[0]
+    const taskId = query.get('taskId')!
+    calls.push({ label, taskId })
+    if (calls.length === 1) return Response.json({error:'rejected'},{status:422})
+    return Response.json(result(taskId))
   })
   const binding = new SessionBinding('session')
   await binding.submit([exportJob('one'),exportJob('two')])
   assert.deepEqual(binding.snapshot().jobs.map(j=>j.status),['failed','done'])
   await binding.submit(binding.snapshot().jobs,true)
-  assert.deepEqual(calls,['one','two','one'])
-  assert.deepEqual(binding.snapshot().results.map(r=>r.id),['one','two'])
+  assert.deepEqual(calls.map(c=>c.label),['one','two','one'])
+  assert.equal(calls[0].taskId, calls[2].taskId)
+  assert.notEqual(calls[0].taskId, calls[1].taskId)
+  assert.deepEqual(binding.snapshot().results.map(r=>r.id),[calls[0].taskId,calls[1].taskId])
+})
+test('lost replies recover only the owning result and do not redispatch completed rows', async t => {
+  const saved = new Map<string, ReturnType<typeof result>>()
+  const posts: string[] = []
+  let available = false, checks = 0
+  t.mock.method(globalThis,'fetch',async (address:string, init: RequestInit) => {
+    const query = new URL(address, 'http://test').searchParams
+    assert.equal(query.get('sessionId'), 'same-session')
+    if (query.get('action') === 'result') {
+      checks++
+      const id = query.get('resultId')!
+      return Response.json(available ? saved.get(id) : result('different-id'))
+    }
+    const id = query.get('taskId')!
+    posts.push(id)
+    saved.set(id, result(id))
+    if (posts.length === 1) throw TypeError('Lost after publication')
+    return Response.json(saved.get(id))
+  })
+  const binding = new SessionBinding('same-session')
+  await binding.submit([exportJob('a'),exportJob('b')])
+  assert.deepEqual(binding.snapshot().jobs.map(j=>j.status),['uncertain','done'])
+  assert.equal(binding.snapshot().jobs[0].taskId, posts[0])
+  available = true
+  await binding.submit(binding.snapshot().jobs,true)
+  assert.equal(posts.length, 2)
+  assert.equal(checks, 2)
+  assert.deepEqual(binding.snapshot().jobs.map(j=>[j.status,j.resultId]),posts.map(id=>['done',id]))
+  assert.equal(binding.snapshot().results.length, 2)
+  await binding.submit([exportJob('a')])
+  assert.equal(posts.length, 3)
+  assert.notEqual(posts[2], posts[0])
 })
 test('cancelling uses the running session task ID and prevents every undispatched row', async t => {
   const running = delayed<Response>()
@@ -77,6 +114,7 @@ test('cancelling uses the running session task ID and prevents every undispatche
       running.resolve(Response.json({error:'Cancelled'},{status:409}))
       return Response.json({ok:true})
     }
+    if (query.get('action') === 'result') return Response.json({error:'missing'},{status:404})
     runs++; runId=query.get('taskId'); return running.promise
   })
   const binding = new SessionBinding('only-this-session')
@@ -96,9 +134,11 @@ test('only a selection needing layout conversion offers the composite merge', ()
 })
 test('completed file rows release their upload references while failed rows remain retryable', async t => {
   let calls=0
-  t.mock.method(globalThis,'fetch',async () => {
+  t.mock.method(globalThis,'fetch',async (address:string) => {
+    const query = new URL(address, 'http://test').searchParams
+    if (query.get('action') === 'result') return Response.json({error:'missing'},{status:404})
     calls++
-    return calls === 1 ? Response.json(result('ok')) : Response.json({error:'failed'},{status:422})
+    return calls === 1 ? Response.json(result(query.get('taskId')!)) : Response.json({error:'failed'},{status:422})
   })
   const first: Item = {...item('a.pdf'),source:{kind:'upload', file:new File(['a'],'a.pdf')}}
   const second: Item = {...item('b.pdf'),source:{kind:'upload', file:new File(['b'],'b.pdf')}}
@@ -120,4 +160,74 @@ test('Word imports select portable image output only when the installed Core sup
   })
   assert.deepEqual(workbenchOptions({...docx, capability_id:'validate.markdown'}), {})
   assert.deepEqual(workbenchOptions({...docx, options_schema:{properties:{image_mode:{enum:['omit']}}}}), {})
+})
+
+test('a slow saved-results refresh cannot replace a newer successful refresh', async t => {
+  const old = delayed<Response>()
+  let requests = 0
+  t.mock.method(globalThis, 'fetch', async (address: string) => {
+    const query = new URL(address, 'http://test').searchParams
+    assert.equal(query.get('action'), 'list')
+    assert.equal(query.get('sessionId'), 'session')
+    return ++requests === 1 ? old.promise : Response.json([result('new')])
+  })
+  const binding = new SessionBinding('session')
+  const first = binding.refreshResults()
+  await binding.refreshResults()
+  assert.deepEqual(binding.snapshot().results.map(row => row.id), ['new'])
+  old.resolve(Response.json([result('old')]))
+  await first
+  assert.deepEqual(binding.snapshot().results.map(row => row.id), ['new'])
+})
+
+test('a superseded results error cannot appear after a newer refresh succeeds', async t => {
+  const old = delayed<Response>()
+  let requests = 0
+  t.mock.method(globalThis, 'fetch', async () =>
+    ++requests === 1 ? old.promise : Response.json([result('new')]))
+  const binding = new SessionBinding('session')
+  const first = binding.refreshResults()
+  await binding.refreshResults()
+  old.resolve(Response.json({ error: 'Old refresh failed' }, { status: 500 }))
+  await first
+  assert.equal(binding.snapshot().error, undefined)
+})
+
+test('saved-results refreshes cannot overwrite completed actions or reappear in a switched session', async t => {
+  const original = delayed<Response>()
+  const afterCompletion = delayed<Response>()
+  let firstLists = 0
+  let finishedId = ''
+  t.mock.method(globalThis, 'fetch', async (address: string) => {
+    const query = new URL(address, 'http://test').searchParams
+    const session = query.get('sessionId')
+    const action = query.get('action')
+    if (session === 'one' && action === 'list') {
+      return ++firstLists === 1 ? original.promise : afterCompletion.promise
+    }
+    if (session === 'one' && action === 'run') {
+      finishedId = query.get('taskId') ?? ''
+      assert.ok(finishedId)
+      return Response.json(result(finishedId))
+    }
+    assert.equal(session, 'two')
+    assert.equal(action, 'list')
+    return Response.json([result('other-session')])
+  })
+  const first = new SessionBinding('one')
+  const startedBeforeAction = first.refreshResults()
+  await first.submit([exportJob('finished')])
+  original.resolve(Response.json([result('obsolete')]))
+  await startedBeforeAction
+  assert.deepEqual(first.snapshot().results.map(row => row.id), [finishedId])
+
+  const switchSignal = new AbortController()
+  const closingPanel = first.refreshResults(switchSignal.signal)
+  switchSignal.abort()
+  const second = new SessionBinding('two')
+  await second.refreshResults()
+  afterCompletion.resolve(Response.json([result('old-view')]))
+  await closingPanel
+  assert.deepEqual(first.snapshot().results.map(row => row.id), [finishedId])
+  assert.deepEqual(second.snapshot().results.map(row => row.id), ['other-session'])
 })

@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { readFileSync, writeFileSync } from 'node:fs'
-import { mkdtemp, mkdir, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { PassThrough } from 'node:stream'
 import { test } from 'node:test'
-import { hash } from '../src/documents.js'
+import { collectBundle, hash } from '../src/documents.js'
+import peerSplit from './fixtures/artifact-bundle.pdf-split.json' with { type: 'json' }
 import { bindImagePaths, layoutPlan, MIXED, PDF, withLayoutMerge } from '../src/inputs.js'
 import { ResultStore } from '../src/result-store.js'
 import { DocumentTasks, type TaskPorts } from '../src/tasks.js'
@@ -255,6 +256,54 @@ for (const mode of ['ok', 'fail', 'cancel'] as const)
     }
   })
 
+test('archives verified members under their original relative names, with no successful partial ZIP', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'docwen-archive-'))
+  const { service } = harness(root, 'ok')
+  try {
+    const { unzipSync } = await import('fflate')
+    const { routeHandler } = await import('../src/host.js')
+    const dispatch = routeHandler(service)
+    const id = randomUUID(), staged = await service.store.staging('s')
+    const md = Buffer.from('![synthetic](assets/图.png)\n')
+    const image = Buffer.from('synthetic asset bytes')
+    const members = [
+      { id: 'note', path: 'note.md', media: 'text/markdown', data: md },
+      { id: 'image', path: 'assets/图.png', media: 'image/png', data: image },
+    ]
+    const files = path.join(staged, 'files')
+    await mkdir(path.join(files, 'assets'), { recursive: true })
+    for (const member of members) await writeFile(path.join(files, member.path), member.data)
+    await service.store.publish('s', staged, {
+      id, label: 'Synthetic archive', primary: 'note', created: new Date().toISOString(), warnings: [],
+      files: members.map(({ data, ...member }) => ({ ...member, bytes: data.length, sha256: hash(data) })),
+    }, new AbortController().signal)
+    const endpoint = 'http://dsh.internal/api/docwen-dsh?sessionId=s&action=archive&resultId=' + id
+    const response = await dispatch(new Request(endpoint))
+    assert.equal(response.status, 200)
+    assert.equal(response.headers.get('Content-Type'), 'application/zip')
+    const zip = new Uint8Array(await response.arrayBuffer())
+    assert.equal(response.headers.get('Content-Length'), String(zip.length))
+    const entries = unzipSync(zip)
+    assert.deepEqual(Object.keys(entries), members.map(m => m.path))
+    for (const m of members) assert.deepEqual(Buffer.from(entries[m.path]), m.data)
+    const openDownload = await dispatch(new Request(endpoint))
+    const reader = openDownload.body!.getReader()
+    assert.equal((await reader.read()).done, false)
+    await reader.cancel()
+    const published = await service.store.get('s', id)
+    await writeFile(path.join(published.files, members[1].path), Buffer.alloc(image.length))
+    const corrupt = await dispatch(new Request(endpoint))
+    assert.equal(corrupt.status, 422)
+    assert.match((await corrupt.json()).error, /changed|incomplete/)
+    const controller = new AbortController()
+    controller.abort()
+    assert.equal((await dispatch(new Request(endpoint, { signal: controller.signal }))).status, 499)
+  } finally {
+    await service.dispose()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('handles the DSH web bridge origin and requires an explicit same-host mutation', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'docwen-bridge-'))
   const { service } = harness(root, 'ok')
@@ -277,3 +326,44 @@ test('handles the DSH web bridge origin and requires an explicit same-host mutat
     await rm(root, { recursive: true, force: true })
   }
 })
+
+for (const preferred of [false, true]) {
+  test(`native delivery includes ordered PDF peers (preferred second: ${preferred})`, async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'docwen-peer-delivery-'))
+    const { service } = harness(root, 'ok')
+    const signal = new AbortController().signal
+    try {
+      const staging = await service.store.staging('s')
+      const outputs = path.join(staging, 'files')
+      const producer = path.join(root, 'producer')
+      await Promise.all([mkdir(outputs), mkdir(path.join(producer, 'parts'), { recursive: true })])
+      const ids = peerSplit.entries.map(entry => entry.artifact_id)
+      const expected = peerSplit.entries.map((_, index) => Buffer.from(`%PDF-1.7
+% section ${index + 1}
+`))
+      const artifacts = await Promise.all(peerSplit.artifacts.map(async (item, index) => {
+        await writeFile(path.join(producer, item.locator), expected[index])
+        return { ...item, size_bytes: expected[index].length, sha256: hash(expected[index]) }
+      }))
+      const bundle = {
+        ...peerSplit, artifacts: artifacts.reverse(),
+        entries: peerSplit.entries.map((entry, index) => ({ ...entry, preferred: preferred && index === 1 })).reverse(),
+      }
+      const collection = await collectBundle(bundle, bundle.task_id, producer, outputs, undefined, signal)
+      assert.equal(collection.primary, ids[preferred ? 1 : 0])
+      const result = { ...collection, id: randomUUID(), label: 'Split PDF', created: new Date().toISOString(), warnings: [] }
+      await service.store.publish('s', staging, result, signal)
+      const files = await service.delivery('s', result.id, signal)
+      assert.deepEqual(files.map(f => path.basename(f.path)), ['part-001.pdf', 'part-002.pdf'])
+      assert.deepEqual(await Promise.all(files.map(f => readFile(f.path))), expected)
+      assert.deepEqual(await Promise.all(peerSplit.artifacts.map(f => readFile(path.join(producer, f.locator)))), expected)
+
+      await writeFile(files[1].path, 'Invalid second file')
+      await assert.rejects(service.delivery('s', result.id, signal), /changed|integrity/i)
+      assert.equal((await service.store.get('s', result.id)).result.files.length, 2)
+    } finally {
+      await service.dispose()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+}

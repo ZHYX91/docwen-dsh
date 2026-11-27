@@ -58,7 +58,7 @@ dsh web
 /docwen run {"action":"process","capabilityId":"merge.pdf.documents","sources":[{"kind":"workspace","path":"first.pdf"},{"kind":"workspace","path":"second.pdf"}],"options":{}}
 ```
 
-用 `/docwen process` 时，在同一条命令中附上输入文件。模型使用独立的 `docwen` 工具，可查询操作、处理指定的文件，并按 ID 复用已保存的产物。在开放的模型轮次里，成功调用可通过 Harness 原生交付主文件。所有入口的完整结果都能在会话面板中取得。
+用 `/docwen process` 时，在同一条命令中附上输入文件。模型使用独立的 `docwen` 工具，可查询操作、处理指定的文件，并按 ID 复用已保存的产物。在开放的模型轮次里，成功调用可通过 Harness 原生交付主文件。拆分 PDF 时，各个独立 PDF 会按顺序交付。所有入口的完整结果都能在会话面板中取得；如果 Markdown 带有图片链接，请下载整组 ZIP。
 
 ## 限额与结果保留
 

@@ -1,0 +1,5 @@
+# Keep the tracked files in the install archive byte-identical on all hosts.
+/README.md text eol=lf
+/README.zh-CN.md text eol=lf
+/cordis.patch.yml text eol=lf
+/package.json text eol=lf
