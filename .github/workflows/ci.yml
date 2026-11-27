@@ -35,43 +35,48 @@ jobs:
         run: npm test
       - name: Verify distributable package
         run: npm pack --dry-run
-      - name: Check out the supported DocWen Core baseline
-        uses: actions/checkout@v4
-        with:
-          repository: ZHYX91/docwen
-          ref: d06bdee5afb80f0df7f3bee78254a050eb205198
-          path: .acceptance/core
-          persist-credentials: false
-      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
-        with:
-          version: "0.12.0"
-          python-version: "3.12.13"
-          enable-cache: true
-          cache-dependency-glob: .acceptance/core/uv.lock
-      - name: Install locked Core and released DSH
+      - name: Verify and unpack published DocWen 0.23.2
         shell: pwsh
         run: |
-          uv sync --project .acceptance/core --frozen --no-dev
+          $root = Join-Path $env:RUNNER_TEMP 'docwen-core-0.23.2'
+          $null = New-Item -ItemType Directory -Path $root
+          if ($IsWindows) {
+            $asset = 'DocWen-windows-x64.zip'
+            $sha256 = '8a93eaccb5cde346f594e9c77aeb91cc11fe2f559d39eef765cfdec44ae94ee1'
+            $name = 'DocWenCLI.exe'
+          } else {
+            $asset = 'DocWenCLI-0.23.2-linux-x64.tar.gz'
+            $sha256 = '35e7eae157b57f65e5ee41ae99dd6169a3eeda77003baf9378519a078c2b3160'
+            $name = 'DocWenCLI'
+          }
+          $archive = Join-Path $env:RUNNER_TEMP $asset
+          Invoke-WebRequest -Uri "https://github.com/ZHYX91/docwen/releases/download/0.23.2/$asset" -OutFile $archive
+          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ine $sha256) {
+            throw 'The DocWen release archive digest does not match the pinned distribution.'
+          }
+          tar -xf $archive -C $root
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $binaries = @(Get-ChildItem -LiteralPath $root -File -Recurse -Filter $name)
+          if ($binaries.Count -ne 1) { throw 'The DocWen release must contain exactly one CLI executable.' }
+          "DOCWEN_DSH_EXECUTABLE=$($binaries[0].FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Install the released DSH host
+        shell: pwsh
+        run: |
           npm install --prefix "$env:RUNNER_TEMP/docwen-test-host" --no-audit --no-fund @deepseek-ai/dsh@0.2.3-alpha.2 pnpm@11.28.5
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "$env:RUNNER_TEMP/docwen-test-host/node_modules/.bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "DSH_BIN=$env:RUNNER_TEMP/docwen-test-host/node_modules/@deepseek-ai/dsh/lib/bin.js" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Install and exercise the packaged plugin in a disposable DSH profile
+        run: node scripts/host-smoke.mjs
+      - name: Exercise the installed DSH session panel in Chromium
         shell: pwsh
         run: |
-          $env:DSH_BIN = "$env:RUNNER_TEMP/docwen-test-host/node_modules/@deepseek-ai/dsh/lib/bin.js"
-          $executable = if ($IsWindows) { 'Scripts/docwen.exe' } else { 'bin/docwen' }
-          $env:DOCWEN_DSH_EXECUTABLE = Join-Path "$PWD/.acceptance/core/.venv" $executable
-          node scripts/host-smoke.mjs
-      - name: Exercise the installed DSH session panel in Chromium
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          ui="$RUNNER_TEMP/docwen-test-browser"
-          npm install --prefix "$ui" --no-audit --no-fund --save-exact playwright@1.62.1
-          "$ui/node_modules/.bin/playwright" install --with-deps chromium
-          export NODE_PATH="$ui/node_modules"
-          export DSH_BIN="$RUNNER_TEMP/docwen-test-host/node_modules/@deepseek-ai/dsh/lib/bin.js"
-          export DOCWEN_DSH_EXECUTABLE="$PWD/.acceptance/core/.venv/bin/docwen"
+          $ui = Join-Path $env:RUNNER_TEMP 'docwen-test-browser'
+          npm install --prefix $ui --no-audit --no-fund --save-exact playwright@1.62.1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $playwright = Join-Path $ui 'node_modules/playwright/cli.js'
+          if ($IsWindows) { node $playwright install chromium }
+          else { node $playwright install --with-deps chromium }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:NODE_PATH = Join-Path $ui 'node_modules'
           node scripts/browser-smoke.mjs
