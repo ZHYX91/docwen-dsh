@@ -60,7 +60,8 @@ jobs:
           if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ine $sha256) {
             throw 'The DocWen release archive digest does not match the pinned distribution.'
           }
-          tar -xf $archive -C $root
+          if ($IsWindows) { python -m zipfile -e $archive $root }
+          else { tar -xf $archive -C $root }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $binaries = @(Get-ChildItem -LiteralPath $root -File -Recurse -Filter $name)
           if ($binaries.Count -ne 1) { throw 'The DocWen release must contain exactly one CLI executable.' }
