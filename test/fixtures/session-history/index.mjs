@@ -1,4 +1,6 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
+import path from 'node:path'
 
 export const name = 'docwen-test-history'
 export const inject = ['sessions', 'attachments', 'connection', 'agents', 'tools', 'sessionQuery']
@@ -23,7 +25,12 @@ export function apply(ctx) {
       if (!agent || !replyId) return new Response(null, { status: 409 })
       const callId = 'docwen-test-' + randomUUID()
       const session = agent.session
-      session.append('turn/start', { turn: 2 })
+      const split = new URL(request.url, 'http://localhost').searchParams.get('case') === 'split'
+      const turn = split ? 3 : 2
+      const options = split
+        ? { action: 'process', capabilityId: 'split.pdf.every_page', sources: [{ kind: 'workspace', path: 'two-pages.pdf' }], options: {} }
+        : { action: 'export', messageIds: [replyId], options: {} }
+      session.append('turn/start', { turn })
       try {
         const batch = await ctx.tools.execute({
           agent,
@@ -33,7 +40,7 @@ export function apply(ctx) {
               type: 'tool-call',
               id: callId,
               name: 'docwen',
-              arguments: JSON.stringify({ action: 'export', messageIds: [replyId], options: {} }),
+              arguments: JSON.stringify(options),
             },
           ],
         })
@@ -43,10 +50,16 @@ export function apply(ctx) {
         )
         return Response.json({
           successful: batch.results.length === 1 && batch.results[0].result.isError === false,
-          deliveries: presentations.map((e) => ({ turn: e.data.turn, count: e.data.files.length })),
+          deliveries: await Promise.all(presentations.map(async (e) => ({
+            turn: e.data.turn, count: e.data.files.length,
+            ...(split ? { files: await Promise.all(e.data.files.map(async (file) => ({
+              name: path.basename(file.path),
+              sha256: createHash('sha256').update(await readFile(file.path)).digest('hex'),
+            }))) } : {}),
+          }))),
         })
       } finally {
-        session.append('turn/end', { turn: 2, reason: { kind: 'completed' } })
+        session.append('turn/end', { turn, reason: { kind: 'completed' } })
       }
     },
   })

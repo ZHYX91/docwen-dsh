@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFile, spawn } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
@@ -15,6 +15,25 @@ const project = fileURLToPath(new URL('..', import.meta.url))
 const bluePng =
   'iVBORw0KGgoAAAANSUhEUgAAAAYAAAAGCAIAAABvrngfAAAAFElEQVR4nGNkYPjPgAqYGDAANYUAca8BC7fe9+IAAAAASUVORK5CYII='
 const docxMedia = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+
+function twoPagePdf() {
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 400] /Resources << >> >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 500 600] /Resources << >> >>',
+  ]
+  let text = '%PDF-1.4\n'
+  const offsets = objects.map((object, index) => {
+    const offset = Buffer.byteLength(text)
+    text += `${index + 1} 0 obj\n${object}\nendobj\n`
+    return offset
+  })
+  const xref = Buffer.byteLength(text)
+  text += 'xref\n0 5\n0000000000 65535 f \n'
+  for (const offset of offsets) text += String(offset).padStart(10, '0') + ' 00000 n \n'
+  return Buffer.from(text + `trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`)
+}
 
 async function npmCli() {
   const candidates = [process.env.npm_execpath]
@@ -371,6 +390,31 @@ async function verifyHost({
   const tool = await (await checked(await request('/api/docwen-smoke-tool', { method: 'POST' }))).json()
   assert.deepEqual(tool, { successful: true, deliveries: [{ turn: 2, count: 1 }] })
   console.log('The installed DSH tool executor presented one native deliverable in an open turn.')
+  const inputPdf = twoPagePdf()
+  const inputPdfPath = path.join(workspace, 'two-pages.pdf')
+  await writeFile(inputPdfPath, inputPdf)
+  const split = await (await checked(await request('/api/docwen-smoke-tool?case=split', { method: 'POST' }))).json()
+  assert.equal(split.successful, true)
+  assert.equal(split.deliveries.length, 1)
+  const [delivery] = split.deliveries
+  assert.equal(delivery.turn, 3)
+  assert.equal(delivery.count, 2)
+  const results = await (await checked(await request(uri('list')))).json()
+  const splitResult = results.find((item) => item.files.length === 2 && item.files.every((file) => file.media === 'application/pdf'))
+  assert.ok(splitResult, 'the complete split remains in Saved Results')
+  const splitFiles = splitResult.entries.map((entry) => splitResult.files.find((file) => file.id === entry.artifact_id))
+  const expected = []
+  for (const file of splitFiles) {
+    const download = await checked(await request(uri('file', { resultId: splitResult.id, artifactId: file.id })))
+    const bytes = Buffer.from(await download.arrayBuffer())
+    assert.equal(bytes.subarray(0, 5).toString(), '%PDF-')
+    assert.equal(createHash('sha256').update(bytes).digest('hex'), file.sha256)
+    expected.push({ name: path.posix.basename(file.path), sha256: file.sha256 })
+  }
+  assert.notEqual(expected[0].sha256, expected[1].sha256)
+  assert.deepEqual(delivery.files, expected)
+  assert.deepEqual(await readFile(inputPdfPath), inputPdf)
+  console.log('One native DSH delivery contains both verified Core PDF parts, in producer order.')
   console.log(
     'Real DSH profile, completed reply, two image sources, templated DOCX, Markdown group, sections, slash command, forked history, upload cancellation and session isolation passed.',
   )

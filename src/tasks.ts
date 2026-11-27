@@ -190,15 +190,29 @@ export class DocumentTasks {
   async delivery(id: string, resultId: string, signal: AbortSignal) {
     await this.scope(id, signal)
     const { result, files } = await this.store.get(id, resultId)
-    const primary = result.files.find((file) => file.id === result.primary)
+    const byId = new Map(result.files.map((file) => [file.id, file]))
+    const primary = byId.get(result.primary)
     if (!primary) return []
-    await readResultFile(files, primary, signal)
-    return [
-      {
-        path: await fileWithin(files, path.join(files, portablePath(primary.path))),
+    const entries = result.entries?.map((entry) => byId.get(entry.artifact_id))
+    // A PDF split contains independent documents; a preferred entry is not
+    // the entire result. Keep resource groups and legacy indexes on their
+    // existing delivery path, with the full group available in the panel ZIP.
+    const selected =
+      entries && entries.length > 1 && entries.length === result.files.length &&
+      entries.every((file) => file?.kind === 'document' && file.media === PDF)
+        ? entries
+        : [primary]
+    const delivered = []
+    for (const file of selected) {
+      if (!file) throw new Error('A saved result entry is missing.')
+      await readResultFile(files, file, signal)
+      delivered.push({
+        path: await fileWithin(files, path.join(files, portablePath(file.path))),
         description: result.label,
-      },
-    ]
+      })
+    }
+    signal.throwIfAborted()
+    return delivered
   }
   run(id: string, intent: Json, signal: AbortSignal, admitted?: readonly Admitted[]) {
     return this.submit(id, randomUUID(), signal, async () => ({ intent }), admitted)

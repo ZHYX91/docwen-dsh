@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { readFileSync, writeFileSync } from 'node:fs'
-import { mkdtemp, mkdir, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { PassThrough } from 'node:stream'
 import { test } from 'node:test'
-import { hash } from '../src/documents.js'
+import { collectBundle, hash } from '../src/documents.js'
+import peerSplit from './fixtures/artifact-bundle.pdf-split.json' with { type: 'json' }
 import { bindImagePaths, layoutPlan, MIXED, PDF, withLayoutMerge } from '../src/inputs.js'
 import { ResultStore } from '../src/result-store.js'
 import { DocumentTasks, type TaskPorts } from '../src/tasks.js'
@@ -277,3 +278,44 @@ test('handles the DSH web bridge origin and requires an explicit same-host mutat
     await rm(root, { recursive: true, force: true })
   }
 })
+
+for (const preferred of [false, true]) {
+  test(`native delivery includes ordered PDF peers (preferred second: ${preferred})`, async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'docwen-peer-delivery-'))
+    const { service } = harness(root, 'ok')
+    const signal = new AbortController().signal
+    try {
+      const staging = await service.store.staging('s')
+      const outputs = path.join(staging, 'files')
+      const producer = path.join(root, 'producer')
+      await Promise.all([mkdir(outputs), mkdir(path.join(producer, 'parts'), { recursive: true })])
+      const ids = peerSplit.entries.map(entry => entry.artifact_id)
+      const expected = peerSplit.entries.map((_, index) => Buffer.from(`%PDF-1.7
+% section ${index + 1}
+`))
+      const artifacts = await Promise.all(peerSplit.artifacts.map(async (item, index) => {
+        await writeFile(path.join(producer, item.locator), expected[index])
+        return { ...item, size_bytes: expected[index].length, sha256: hash(expected[index]) }
+      }))
+      const bundle = {
+        ...peerSplit, artifacts: artifacts.reverse(),
+        entries: peerSplit.entries.map((entry, index) => ({ ...entry, preferred: preferred && index === 1 })).reverse(),
+      }
+      const collection = await collectBundle(bundle, bundle.task_id, producer, outputs, undefined, signal)
+      assert.equal(collection.primary, ids[preferred ? 1 : 0])
+      const result = { ...collection, id: randomUUID(), label: 'Split PDF', created: new Date().toISOString(), warnings: [] }
+      await service.store.publish('s', staging, result, signal)
+      const files = await service.delivery('s', result.id, signal)
+      assert.deepEqual(files.map(f => path.basename(f.path)), ['part-001.pdf', 'part-002.pdf'])
+      assert.deepEqual(await Promise.all(files.map(f => readFile(f.path))), expected)
+      assert.deepEqual(await Promise.all(peerSplit.artifacts.map(f => readFile(path.join(producer, f.locator)))), expected)
+
+      await writeFile(files[1].path, 'Invalid second file')
+      await assert.rejects(service.delivery('s', result.id, signal), /changed|integrity/i)
+      assert.equal((await service.store.get('s', result.id)).result.files.length, 2)
+    } finally {
+      await service.dispose()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+}
