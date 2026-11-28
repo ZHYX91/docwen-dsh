@@ -1,11 +1,23 @@
 import { lstat, mkdir, mkdtemp, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { fileWithin, hash, readResult, readResultFile, type Result } from './documents.js'
+import { fileWithin, hash, readResult, readResultFile, type Result, type ResultPage } from './documents.js'
 
 export const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu
 export const sessionKey = /^[\w.:-]{1,180}$/u
 const absent = (error: unknown) => (error as NodeJS.ErrnoException)?.code === 'ENOENT'
+const PAGE_SIZE = 24
+type ResultKey = { time: number; id: string }
+const newestFirst = (left: ResultKey, right: ResultKey) => right.time - left.time || right.id.localeCompare(left.id)
+
+function pageKey(cursor: string): ResultKey {
+  if (cursor.length > 64) throw new Error('Invalid result page cursor.')
+  const [timestamp, id, extra] = cursor.split(':')
+  const time = Number(timestamp)
+  if (extra !== undefined || !/^\d+$/u.test(timestamp) || !Number.isSafeInteger(time) || !uuid.test(id ?? ''))
+    throw new Error('Invalid result page cursor.')
+  return { time, id }
+}
 
 async function directory(parent: string, name: string, create: boolean): Promise<string> {
   const target = path.join(parent, name)
@@ -48,21 +60,40 @@ export class ResultStore {
     if (result.id !== id) throw new Error('The saved result has an unexpected identity.')
     return { result, files: await directory(folder, 'files', false) }
   }
-  async list(session: string): Promise<Result[]> {
-    let names: string[]
+  async list(session: string, signal: AbortSignal, before?: string): Promise<ResultPage> {
+    const boundary = before === undefined ? undefined : pageKey(before)
+    let root: string, names: string[]
     try {
-      names = await readdir(await this.root(session))
+      root = await this.root(session)
+      names = await readdir(root)
     } catch (error) {
-      if (absent(error)) return []
+      if (absent(error)) return { results: [] }
       throw error
     }
+    // The new result directory's write time comes from creating result.json
+    // immediately before publication. Stat all names, parse only one page.
+    const candidates: ResultKey[] = []
+    for (const id of names) {
+      signal.throwIfAborted()
+      if (!uuid.test(id)) continue
+      const stat = await lstat(path.join(root, id)).catch(error => {
+        if (!absent(error)) throw error
+      })
+      if (!stat?.isDirectory()) continue
+      const key = { time: Math.trunc(stat.mtimeMs), id }
+      if (!boundary || newestFirst(key, boundary) > 0) candidates.push(key)
+    }
+    candidates.sort(newestFirst)
     const results: Result[] = []
-    for (const id of names.filter((name) => uuid.test(name))) {
+    let scanned = 0
+    while (results.length < PAGE_SIZE && scanned < candidates.length) {
+      signal.throwIfAborted()
+      const { id } = candidates[scanned++]
       try {
         results.push((await this.get(session, id)).result)
       } catch {
         // A missing or corrupt manifest must not hide healthy groups. A concurrent deletion can disappear.
-        if (!(await lstat(path.join(await this.root(session), id)).catch(() => undefined))) continue
+        if (!(await lstat(path.join(root, id)).catch(() => undefined))) continue
         results.push({
           id,
           label: 'Unavailable result',
@@ -73,7 +104,8 @@ export class ResultStore {
         })
       }
     }
-    return results.sort((a, b) => b.created.localeCompare(a.created))
+    const last = candidates[scanned - 1]
+    return { results, next: last && scanned < candidates.length ? `${last.time}:${last.id}` : undefined }
   }
   async read(session: string, id: string, artifact: string, signal: AbortSignal) {
     const { result, files } = await this.get(session, id)

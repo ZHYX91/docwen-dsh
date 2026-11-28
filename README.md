@@ -10,6 +10,8 @@ The DSH plugin installer calls `pnpm`. Keep it on the same PATH as the host. The
 
 Use DeepSeek Harness Web `0.2.3-alpha.2` and a local DocWen Machine v2 CLI (development baseline `0.23.2`). The Harness host and DocWen process must share a local filesystem. Install the CLI on the host's PATH or set `DOCWEN_DSH_EXECUTABLE` to its absolute executable path before starting Harness. A source-installed CLI commonly uses the executable name `docwen`.
 
+For the public preview, download `zhyx91-docwen-dsh-0.1.0.tgz` and `SHA256SUMS` from the [GitHub release](https://github.com/ZHYX91/docwen-dsh/releases/tag/0.1.0), verify the checksum, and install the archive with the last two commands below. Use DocWen `0.24.1` or later for the revised PDF layout and redistribution notices.
+
 From the plugin source checkout, with a supported Node version (`^24.22.3 || >=26.13.1`):
 
 ```sh
@@ -62,7 +64,7 @@ Attach the input files to `/docwen process`. The separate `docwen` model tool ca
 
 ## Limits and lifecycle
 
-One active document task per session, up to four across the host. Each task has a five-minute deadline. Inputs are limited to 64 files, 32 MiB per file and 96 MiB in total. Source previews are capped at 2 MiB. Reordering, cancellation and per-item retries apply to the current batch; after a browser restart, local uploads must be selected again. Closing a live session or unloading the plugin cancels its active work. Completed results remain under `docwen-dsh` in `DSH_HOME` (default `~/.dsh`) until removed. A private staging directory is retained if subprocess exit cannot be confirmed.
+One active document task per session, up to four across the host. Each task has a five-minute deadline. Inputs are limited to 64 files, 32 MiB per file and 96 MiB in total. Source and historical reply previews are capped at 2 MiB. Reordering, cancellation and per-item retries apply to the current batch. After a browser restart, select local uploads again. Closing a live session or unloading the plugin cancels its active work. Saved results are listed in pages and remain under `docwen-dsh` in `DSH_HOME` (default `~/.dsh`) until removed. If subprocess exit is uncertain, the session stays busy and staging stays private until the original process is confirmed stopped.
 
 Session workspace files use the Harness file service. The plugin verifies their resolved workspace identity before use. Session attachments are resolved from trusted Harness references. File identities, sizes and SHA-256 hashes are checked when saving results and again before delivery. The published file list and the ZIP preserve the Bundle's logical paths.
 

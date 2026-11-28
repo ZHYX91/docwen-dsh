@@ -13,6 +13,7 @@ await build({
   target: 'node24',
   bundle: true,
   format: 'esm',
+  banner: { js: "import { createRequire as createBundledRequire } from 'node:module'; const require = createBundledRequire(import.meta.url);" },
   outExtension: { '.js': '.mjs' },
   external: ['react', 'react/*'],
 })

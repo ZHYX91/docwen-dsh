@@ -45,8 +45,14 @@ export interface ManagedProcess {
 }
 
 export class UnconfirmedExit extends Error {
-  constructor() {
+  constructor(private readonly child: ManagedProcess) {
     super('DocWen process cleanup could not be confirmed. Its private staging directory was retained.')
+  }
+
+  async confirm(): Promise<boolean> {
+    return Promise.race([
+      this.child.waitForExit(AbortSignal.timeout(250)).catch(() => false), delay(250, false),
+    ])
   }
 }
 
@@ -173,7 +179,7 @@ async function withMachine<T>(
       const stopped = await Promise.race([
         child.waitForExit(AbortSignal.timeout(6000)).catch(() => false), delay(6000, false, { ref: false }),
       ])
-      if (!stopped) throw new UnconfirmedExit()
+      if (!stopped) throw new UnconfirmedExit(child)
       if (!failed && (exit ?? await Promise.race([done, delay(500, null, { ref: false })]))?.exitCode !== 0) {
         throw new Error('DocWen did not exit cleanly.')
       }

@@ -2,11 +2,12 @@ import { randomUUID } from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
 import { Zip, ZipPassThrough } from 'fflate'
-import { IMAGE_MEDIA, MAX_DOCUMENT, MAX_RESULT, readResultFile, sections } from './documents.js'
+import { IMAGE_MEDIA, readResultFile, sections } from './documents.js'
 import { registerEntries, type EntryHost } from './entries.js'
-import { IMPORT, MARKDOWN, object, text } from './machine.js'
+import { MARKDOWN, object, text, UnconfirmedExit } from './machine.js'
 import { ResultStore, sessionKey } from './result-store.js'
 import { Busy, DocumentTasks, type OpenInput, type TaskPorts } from './tasks.js'
+import { MAX_JSON, receiveUploads, TooLarge } from './uploads.js'
 
 const route = '/api/docwen-dsh'
 const noCache = { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' }
@@ -30,7 +31,6 @@ interface Host extends TaskPorts {
 export const name = 'docwen-dsh'
 export const inject = ['connection', 'sessionQuery', 'workspaceFiles', 'attachments', 'subprocess']
 
-class TooLarge extends Error {}
 async function bodyBytes(request: Request, limit: number, signal: AbortSignal): Promise<Buffer> {
   signal.throwIfAborted()
   if (Number(request.headers.get('content-length') ?? 0) > limit)
@@ -61,64 +61,14 @@ async function bodyBytes(request: Request, limit: number, signal: AbortSignal): 
 }
 const parseJSON = (bytes: Uint8Array) =>
   object(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)))
-const maxJSON = 256 * 1024
-
-async function taskInput(r: Request, query: URLSearchParams, signal: AbortSignal): Promise<OpenInput> {
-  const action = query.get('action')
-  if (action === 'export') {
-    const { proofread } = parseJSON(await bodyBytes(r, 2048, signal))
-    if (typeof proofread !== 'boolean') throw new Error('Choose whether to proofread the exported document.')
-    return {
-      intent: {
-        action: 'export',
-        messageIds: [query.get('messageId')],
-        options: proofread ? { proofread: {} } : {},
-      },
-    }
-  }
-  if (action === 'import') {
-    const filename = query.get('filename') ?? ''
-    if (!/\.docx$/iu.test(filename)) throw new Error('Choose a .docx file.')
-    const data = await bodyBytes(r, MAX_DOCUMENT, signal)
-    return {
-      uploads: new Map([['file0', new File([new Uint8Array(data)], filename)]]),
-      intent: {
-        action: 'process',
-        capabilityId: IMPORT,
-        sources: [{ kind: 'upload', field: 'file0' }],
-        options: {
-          preserve_resources: true,
-          image_mode: 'file',
-          image_link_style: 'markdown_embed',
-          recognize_text: false,
-        },
-      },
-    }
-  }
+async function taskInput(
+  r: Request, signal: AbortSignal, stageUploads: () => Promise<string>,
+): Promise<OpenInput> {
   const contentType = r.headers.get('content-type') ?? ''
   if (!contentType.toLowerCase().startsWith('multipart/form-data'))
-    return { intent: parseJSON(await bodyBytes(r, maxJSON, signal)) }
-  const bytes = await bodyBytes(r, MAX_RESULT + 1024 * 1024, signal)
-  const form = await new Response(new Uint8Array(bytes), {
-    headers: { 'Content-Type': contentType },
-  }).formData()
-  const value = form.get('intent')
-  if (typeof value !== 'string' || Buffer.byteLength(value) > maxJSON || form.getAll('intent').length !== 1)
-    throw new Error('Missing or invalid file operation.')
-  const uploads = new Map<string, File>()
-  for (const [key, file] of form) {
-    if (key === 'intent') continue
-    if (
-      !/^file\d{1,2}$/u.test(key) ||
-      typeof file === 'string' ||
-      uploads.has(key) ||
-      file.size > MAX_DOCUMENT ||
-      uploads.size >= 64
-    )
-      throw new Error('Invalid or oversized file upload.')
-    uploads.set(key, file)
-  }
-  return { intent: object(JSON.parse(value)), uploads }
+    return { intent: parseJSON(await bodyBytes(r, MAX_JSON, signal)) }
+  const form = await receiveUploads(r, contentType, await stageUploads(), signal)
+  return { intent: object(JSON.parse(form.intent)), uploads: form.uploads }
 }
 
 function bitmap(bytes: Uint8Array, media: string) {
@@ -218,22 +168,20 @@ export function routeHandler(tasks: DocumentTasks) {
           await tasks.store.remove(id, text(body.resultId))
           return json({ ok: true })
         }
-        if (!['run', 'export', 'import'].includes(action ?? ''))
+        if (action !== 'run')
           return json({ error: 'Unknown document operation.' }, 400)
-        const upload =
-          action === 'import' ||
-          (request.headers.get('content-type') ?? '').toLowerCase().startsWith('multipart/form-data')
+        const upload = (request.headers.get('content-type') ?? '').toLowerCase().startsWith('multipart/form-data')
         if (upload !== url.pathname.endsWith('/upload'))
           return json({ error: 'The operation was sent to the wrong route.' }, 400)
         return json(
-          await tasks.submit(id, query.get('taskId') ?? randomUUID(), signal, (s) =>
-            taskInput(request, query, s),
+          await tasks.submit(id, query.get('taskId') ?? randomUUID(), signal, (s, stageUploads) =>
+            taskInput(request, s, stageUploads),
           ),
         )
       }
       if (request.method !== 'GET') return json({ error: 'Unsupported method.' }, 405)
       if (action === 'catalog') return json(await tasks.catalog(id, signal))
-      if (action === 'list') return json(await tasks.list(id, signal))
+      if (action === 'list') return json(await tasks.list(id, signal, query.get('before') ?? undefined))
       if (action === 'attachments') return json(await tasks.attachments(id, signal))
       if (action === 'preview') return json(await tasks.preview(id, text(query.get('messageId')), signal))
       if (action === 'source-preview') {
@@ -247,7 +195,7 @@ export function routeHandler(tasks: DocumentTasks) {
         })
       }
       await tasks.scope(id, signal)
-      if (action === 'active') return json(tasks.active(id))
+      if (action === 'active') return json(await tasks.active(id))
       if (action === 'result') return json((await tasks.store.get(id, text(query.get('resultId')))).result)
       if (!['file', 'archive', 'sections'].includes(action ?? ''))
         return json({ error: 'Unknown result operation.' }, 400)
@@ -267,6 +215,8 @@ export function routeHandler(tasks: DocumentTasks) {
           : json({ error: 'Choose a Markdown artifact.' }, 415)
       return binary(new Uint8Array(bytes), file.media, file.path, query.get('inline') === '1' && bitmap(bytes, file.media))
     } catch (error) {
+      if (error instanceof UnconfirmedExit)
+        return json({ error: error.message, code: 'process_exit_unconfirmed' }, 409)
       if (request.signal.aborted) return json({ error: 'The document request was cancelled.' }, 499)
       if (error instanceof Busy) return json({ error: error.message }, 409)
       if (error instanceof TooLarge) return json({ error: error.message }, 413)

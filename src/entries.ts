@@ -1,4 +1,4 @@
-import type { Result } from './documents.js'
+import type { Result, ResultPage } from './documents.js'
 import type { MachineCatalog } from './machine.js'
 
 type Json = Record<string, unknown>
@@ -12,7 +12,7 @@ export type EntryIntent =
 export type AdmittedAttachment = { type: 'file' | 'image'; attachment: Json }
 type DeliveredFile = { path: string; description?: string }
 export interface EntryApi {
-  list(sessionId: string, signal: AbortSignal): Promise<Result[]>
+  list(sessionId: string, signal: AbortSignal, before?: string): Promise<ResultPage>
   catalog(sessionId: string, signal: AbortSignal): Promise<MachineCatalog>
   run(sessionId: string, intent: EntryIntent, signal: AbortSignal, admitted?: readonly AdmittedAttachment[]): Promise<Result>
   cancel(sessionId: string, taskId: string): boolean
@@ -51,7 +51,7 @@ export interface EntryHost {
 
 const help = [
   '/docwen capabilities [capability-id] — discover operations, options and templates',
-  '/docwen results — list saved results in this conversation',
+  '/docwen results [cursor] — list saved results in this conversation',
   '/docwen export <message-id> [more IDs] — export completed replies in order',
   '/docwen process <capability-id> — process the files attached to this command in order',
   '/docwen run <JSON> — specify export or process options and ordered sources',
@@ -113,7 +113,8 @@ function commandInput(raw: string, attached: readonly AdmittedAttachment[]): Jso
   const line = raw.trim()
   const [verb, ...words] = line.split(/\s+/u)
   if (attached.length && verb !== 'process') throw new Error('Use /docwen process <capability-id> with attached files.')
-  if ((!verb || verb === 'help' || verb === 'results') && !words.length) return { action: verb || 'help' }
+  if ((!verb || verb === 'help') && !words.length) return { action: verb || 'help' }
+  if (verb === 'results' && words.length <= 1) return { action: verb, before: words[0] }
   if (verb === 'capabilities' && words.length <= 1) return { action: verb, ...(words[0] ? { capabilityId: words[0] } : {}) }
   if (verb === 'cancel' && words.length === 1) return { action: verb, taskId: words[0] }
   if (verb === 'export') return { action: verb, messageIds: words }
@@ -148,7 +149,8 @@ const parameters = {
   type: 'object', additionalProperties: false, required: ['action'], properties: {
     action: { type: 'string', enum: ['capabilities', 'results', 'export', 'process', 'cancel'] },
     capabilityId: { type: 'string', description: 'Use an ID advertised by capabilities. Optional to describe one capability.' },
-    taskId: { type: 'string' }, messageIds: { type: 'array', items: { type: 'string' }, description: 'Completed historical reply IDs, in requested order.' },
+    taskId: { type: 'string' }, before: { type: 'string', description: 'Next cursor from a previous results listing.' },
+    messageIds: { type: 'array', items: { type: 'string' }, description: 'Completed historical reply IDs, in requested order.' },
     sources: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['kind'], properties: {
       kind: { type: 'string', enum: ['workspace', 'attachment', 'result'] }, path: { type: 'string', description: 'Requested workspace-relative file.' },
       attachmentId: { type: 'string' }, resultId: { type: 'string' }, artifactId: { type: 'string' },
@@ -161,8 +163,10 @@ export function registerEntries(ctx: EntryHost, api: EntryApi): void {
     signal.throwIfAborted()
     if (args.action === 'help') { keys(args, ['action']); return { value: { help } } }
     if (args.action === 'results') {
-      keys(args, ['action'])
-      return { value: { results: (await api.list(session.id, signal)).map(summary) } }
+      keys(args, ['action', 'before'])
+      const before = args.before === undefined ? undefined : id(args.before)
+      const page = await api.list(session.id, signal, before)
+      return { value: { results: page.results.map(summary), next: page.next } }
     }
     if (args.action === 'capabilities') {
       keys(args, ['action', 'capabilityId'])

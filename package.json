@@ -2,6 +2,7 @@
   "name": "@zhyx91/docwen-dsh",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "DocWen document workflows for DeepSeek Harness",
   "repository": {
@@ -20,6 +21,7 @@
     "./package.json": "./package.json"
   },
   "files": [
+    "LICENSE",
     "dist/host.js",
     "dist/client.js",
     "dist/THIRD-PARTY-NOTICES.txt",
@@ -46,6 +48,7 @@
     "prepare": "node scripts/build.mjs"
   },
   "devDependencies": {
+    "@fastify/busboy": "3.2.1",
     "@types/node": "24.19.3",
     "@types/react": "18.3.32",
     "esbuild": "0.28.2",

@@ -26,6 +26,13 @@ test('selection honours availability, source roles, and required non-source slot
   assert.ok(compatible({...cap, availability:'limited'},[item('yes.pdf')]))
   assert.ok(!compatible(capability('resolved',[pdf,{ ...pdf, role:'resolved',min_items:1 }]),[item('yes.pdf')]))
 })
+test('a multi-file job observes the server file-count limit but permits independent batch jobs', () => {
+  const sources = Array.from({ length: 65 }, (_, index) => item(`${index}.pdf`))
+  const merged = capability('merge.pdf.documents', [{ role: 'source', min_items: 2, media_types: pdf.media_types }])
+  assert.equal(jobsFor(merged, sources.slice(0, 64), {}).length, 1)
+  assert.deepEqual(jobsFor(merged, sources, {}), [])
+  assert.equal(jobsFor(capability('split.pdf.every_page', [pdf]), sources, {}).length, 65)
+})
 test('Markdown plus individually picked images is a single job with explicit roles, including mixed uploads', async () => {
   const cap = capability('convert.markdown_source.to_docx',[
     { ...pdf, media_types:['text/markdown'] }, {role:'linked_resource',min_items:0,media_types:['image/png']},
@@ -169,13 +176,13 @@ test('a slow saved-results refresh cannot replace a newer successful refresh', a
     const query = new URL(address, 'http://test').searchParams
     assert.equal(query.get('action'), 'list')
     assert.equal(query.get('sessionId'), 'session')
-    return ++requests === 1 ? old.promise : Response.json([result('new')])
+    return ++requests === 1 ? old.promise : Response.json({ results: [result('new')] })
   })
   const binding = new SessionBinding('session')
   const first = binding.refreshResults()
   await binding.refreshResults()
   assert.deepEqual(binding.snapshot().results.map(row => row.id), ['new'])
-  old.resolve(Response.json([result('old')]))
+  old.resolve(Response.json({ results: [result('old')] }))
   await first
   assert.deepEqual(binding.snapshot().results.map(row => row.id), ['new'])
 })
@@ -184,7 +191,7 @@ test('a superseded results error cannot appear after a newer refresh succeeds', 
   const old = delayed<Response>()
   let requests = 0
   t.mock.method(globalThis, 'fetch', async () =>
-    ++requests === 1 ? old.promise : Response.json([result('new')]))
+    ++requests === 1 ? old.promise : Response.json({ results: [result('new')] }))
   const binding = new SessionBinding('session')
   const first = binding.refreshResults()
   await binding.refreshResults()
@@ -212,12 +219,12 @@ test('saved-results refreshes cannot overwrite completed actions or reappear in 
     }
     assert.equal(session, 'two')
     assert.equal(action, 'list')
-    return Response.json([result('other-session')])
+    return Response.json({ results: [result('other-session')] })
   })
   const first = new SessionBinding('one')
   const startedBeforeAction = first.refreshResults()
   await first.submit([exportJob('finished')])
-  original.resolve(Response.json([result('obsolete')]))
+  original.resolve(Response.json({ results: [result('obsolete')] }))
   await startedBeforeAction
   assert.deepEqual(first.snapshot().results.map(row => row.id), [finishedId])
 
@@ -226,7 +233,7 @@ test('saved-results refreshes cannot overwrite completed actions or reappear in 
   switchSignal.abort()
   const second = new SessionBinding('two')
   await second.refreshResults()
-  afterCompletion.resolve(Response.json([result('old-view')]))
+  afterCompletion.resolve(Response.json({ results: [result('old-view')] }))
   await closingPanel
   assert.deepEqual(first.snapshot().results.map(row => row.id), [finishedId])
   assert.deepEqual(second.snapshot().results.map(row => row.id), ['other-session'])

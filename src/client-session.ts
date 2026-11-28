@@ -1,9 +1,14 @@
-import type { Result } from './documents.js'
+import type { Result, ResultPage } from './documents.js'
 import { api, HttpFailure, identifier, json, shifted, wireIntent, type Attachment, type Catalog, type Job, type Reply } from './client-model.js'
 
-export interface Active { id: string; progress?: number | { completed?: number; total?: number; message?: string } }
+export interface Active {
+  id: string
+  phase?: 'awaiting_exit'
+  progress?: number | { completed?: number; total?: number; message?: string }
+}
 interface State {
   results: Result[]
+  resultsCursor?: string
   catalog?: Catalog
   attachments: Attachment[]
   jobs: Job[]
@@ -49,13 +54,24 @@ export class SessionBinding {
       .finally(() => { this.loading = undefined })
     return this.loading
   }
-  refreshResults = async (signal = this.lifecycle.signal) => {
+  refreshResults = (signal = this.lifecycle.signal) => this.fetchResults(signal)
+  moreResults = () => {
+    const before = this.state.resultsCursor
+    if (before) return this.fetchResults(this.lifecycle.signal, before)
+  }
+  private async fetchResults(signal: AbortSignal, before?: string) {
     const revision = this.revision
     const sequence = ++this.resultSequence
     const isCurrent = () => !signal.aborted && revision === this.revision && sequence === this.resultSequence
     try {
-      const results = await json<Result[]>(this.url('list'), { signal })
-      if (isCurrent()) this.set({ results })
+      const page = await json<ResultPage>(this.url('list', before ? { before } : {}), { signal })
+      if (!isCurrent()) return
+      if (!before) this.set({ results: page.results, resultsCursor: page.next })
+      else {
+        const seen = new Set(this.state.results.map(result => result.id))
+        this.set({ results: [...this.state.results, ...page.results.filter(result => !seen.has(result.id))],
+          resultsCursor: page.next })
+      }
     } catch (error) { if (isCurrent()) this.set({ error: String(error) }) }
   }
   refreshAttachments = async (signal: AbortSignal) => {
@@ -132,7 +148,8 @@ export class SessionBinding {
           if (saved) {
             this.acceptResult(saved)
             queue[index] = finish(queue[index], 'done', taskId)
-          } else if (this.state.stopping && error instanceof HttpFailure && error.status < 500) {
+          } else if (this.state.stopping && error instanceof HttpFailure && error.status < 500 &&
+            error.code !== 'process_exit_unconfirmed') {
             queue[index] = finish(queue[index], 'cancelled')
           } else {
             const rejected = error instanceof HttpFailure && [400, 403, 404, 413, 422].includes(error.status)
