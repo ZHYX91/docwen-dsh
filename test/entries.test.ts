@@ -24,7 +24,7 @@ function mount() {
     on(_event, listener) { notify = listener },
   }
   const api: EntryApi = {
-    async list() { return [result] },
+    async list() { return { results: [result] } },
     async catalog() { return { capabilities: [], templates: [], numberingSchemes: [], optimizations: [] } },
     async run(...input) { calls.push(input); return result },
     cancel() { return true },

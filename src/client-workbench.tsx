@@ -4,6 +4,7 @@ import { OptionFields } from './client-options.js'
 import { api, available, capName, compatible, fileMedia, identifier, jobsFor, LAYOUT_MERGE, resultItem, shifted, sourceSlot, workbenchOptions,
   type Attachment, type Catalog, type Item, type Options, type Text } from './client-model.js'
 import type { SessionBinding } from './client-session.js'
+import { MAX_PREVIEW } from './limits.js'
 
 const raster = new Set(['image/png', 'image/gif', 'image/jpeg', 'image/webp', 'image/bmp'])
 const plain = new Set(['text/markdown', 'text/plain'])
@@ -16,7 +17,7 @@ export function FilePreview({ sessionId, item, t }: { sessionId: string; item: I
     async function load() {
       const source = item.source
       let blob: Blob
-      const limit = 2 * 1024 * 1024
+      const limit = MAX_PREVIEW
       if (item.bytes !== undefined && item.bytes > limit) throw new Error(t('Preview limit: 2 MiB.', '预览上限为 2 MiB。'))
       if (source.kind === 'upload') blob = source.file
       else {

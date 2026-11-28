@@ -217,14 +217,18 @@ function Panel({ binding, locale, inputActions }: View) {
       {state.catalog && <ExportForm binding={binding} catalog={state.catalog} replies={state.replies} t={t}/>}
     </fieldset>}
     {state.catalog && <Workbench binding={binding} catalog={state.catalog} results={state.results} attachments={state.attachments} busy={busy} t={t}/>}
-    {busy && <p role="status">{t('Processing…','正在处理…')} <progress value={percent} max={100}/>{' '}
-      <button type="button" disabled={state.stopping} onClick={() => void binding.cancel()}>{t('Cancel','取消')}</button></p>}
+    {busy && (state.active?.phase === 'awaiting_exit'
+      ? <p role="status">{t('Waiting for DocWen to exit…', '正在等待 DocWen 退出…')}</p>
+      : <p role="status">{t('Processing…','正在处理…')} <progress value={percent} max={100}/>{' '}
+        <button type="button" disabled={state.stopping} onClick={() => void binding.cancel()}>{t('Cancel','取消')}</button></p>)}
     {state.jobs.length > 0 && <div><ul>{state.jobs.map((job,i) => <li key={i}>{job.label} · {statusText(job,t)} {job.error}</li>)}</ul>
       {state.jobs.some(j => j.status === 'failed' || j.status === 'uncertain') && <button type="button" disabled={busy}
         onClick={() => void binding.submit(state.jobs,true)}>{state.jobs.some(j => j.status === 'uncertain') ? t('Check and retry unfinished items','核对并重试未完成项')
           : t('Retry failed items','重试失败项')}</button>}</div>}
     {state.results.length > 0 && <><h4>{t('Saved results','已保存的结果')}</h4><ul>{state.results.map(result =>
-      <ResultRow key={result.id} binding={binding} result={result} t={t} inputActions={inputActions}/>)}</ul></>}
+      <ResultRow key={result.id} binding={binding} result={result} t={t} inputActions={inputActions}/>)}</ul>
+      {state.resultsCursor && <button type="button" onClick={() => void binding.moreResults()}>
+        {t('Load older results','载入更早的结果')}</button>}</>}
   </div>
 }
 export function apply(ctx: Client): void {

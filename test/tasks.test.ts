@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { readFileSync, writeFileSync } from 'node:fs'
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, readdir, rm, utimes, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { PassThrough } from 'node:stream'
@@ -11,6 +11,7 @@ import peerSplit from './fixtures/artifact-bundle.pdf-split.json' with { type: '
 import { bindImagePaths, layoutPlan, MIXED, PDF, withLayoutMerge } from '../src/inputs.js'
 import { ResultStore } from '../src/result-store.js'
 import { DocumentTasks, type TaskPorts } from '../src/tasks.js'
+import { receiveUploads } from '../src/uploads.js'
 
 const OFD = 'application/vnd.ofd',
   XPS = 'application/vnd.ms-xpsdocument'
@@ -58,9 +59,10 @@ test('binds referenced images without rewriting code, ordinary links or visible 
 
 /** Simulate a future OFD adapter at the byte-framed Machine boundary. Actual PDF execution is
  * verified separately against Core; this fixture exercises deterministic failure/cancellation. */
-function harness(root: string, mode: 'ok' | 'fail' | 'cancel') {
+function harness(root: string, mode: 'ok' | 'fail' | 'cancel' | 'awaiting-exit') {
   const planned: string[] = []
   let cancel = () => {}
+  let exitConfirmed = mode !== 'awaiting-exit'
   const process = () => {
     const stdin = new PassThrough(),
       stdout = new PassThrough()
@@ -162,7 +164,7 @@ function harness(root: string, mode: 'ok' | 'fail' | 'cancel') {
       },
       async waitForExit() {
         await done
-        return true
+        return exitConfirmed
       },
     }
   }
@@ -190,8 +192,78 @@ function harness(root: string, mode: 'ok' | 'fail' | 'cancel') {
   }
   const service = new DocumentTasks(ports, new ResultStore(root), 'docwen')
   cancel = () => service.closeSession('s')
-  return { service, planned }
+  return { service, planned, confirmExit: () => { exitConfirmed = true } }
 }
+
+test('streams multipart files into the task directory under server-assigned paths', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'docwen-upload-'))
+  const signal = new AbortController().signal
+  const form = new FormData()
+  form.set('file0', new File(['document'], '会议纪要.docx'))
+  form.set('intent', '{"action":"process"}')
+  const request = new Request('http://test/upload', { method: 'POST', body: form })
+  try {
+    const received = await receiveUploads(request, request.headers.get('content-type')!, root, signal)
+    assert.equal(received.intent, '{"action":"process"}')
+    assert.deepEqual(received.uploads.get('file0'), { name: '会议纪要.docx', path: path.join(root, 'file0'), size: 8 })
+    assert.equal(await readFile(path.join(root, 'file0'), 'utf8'), 'document')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('paginates result metadata without duplicating entries after a newer publication', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'docwen-pages-'))
+  const store = new ResultStore(root)
+  const signal = new AbortController().signal
+  const timestamp = Date.now()
+  const add = async (i: number) => {
+    const id = randomUUID()
+    const folder = path.join(await store.root('s', true), id)
+    await mkdir(path.join(folder, 'files'), { recursive: true })
+    await writeFile(path.join(folder, 'result.json'), '{')
+    await utimes(folder, new Date(timestamp + i * 1000), new Date(timestamp + i * 1000))
+    return id
+  }
+  try {
+    const ids = []
+    for (let index = 0; index < 26; index++) ids.push(await add(index))
+    const first = await store.list('s', signal)
+    assert.deepEqual(first.results.map(result => result.id), ids.slice(2).reverse())
+    assert.ok(first.next)
+    const nextId = await add(26)
+    const older = await store.list('s', signal, first.next)
+    assert.deepEqual(older.results.map(result => result.id), ids.slice(0, 2).reverse())
+    assert.equal(older.next, undefined)
+    assert.equal((await store.list('s', signal)).results[0].id, nextId)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('holds a session until the original Core process is confirmed stopped', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'docwen-exit-'))
+  const { service, confirmExit } = harness(root, 'awaiting-exit')
+  const { routeHandler } = await import('../src/host.js')
+  const dispatch = routeHandler(service)
+  const taskId = randomUUID()
+  const run = () => dispatch(new Request(`http://test/api/docwen-dsh?sessionId=s&action=run&taskId=${taskId}`, {
+    method: 'POST', headers: { 'x-docwen-dsh': '1', 'content-type': 'application/json' },
+    body: JSON.stringify({ action: 'process', capabilityId: merge.capability_id }),
+  }))
+  try {
+    const first = await run()
+    assert.equal(first.status, 409)
+    assert.equal((await first.json()).code, 'process_exit_unconfirmed')
+    assert.deepEqual(await service.active('s'), { id: taskId, phase: 'awaiting_exit' })
+    assert.equal((await run()).status, 409)
+    confirmExit()
+    assert.equal(await service.active('s'), null)
+    assert.equal((await run()).status, 422)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
 
 for (const mode of ['ok', 'fail', 'cancel'] as const)
   test('mixed layout task: ' + mode, async () => {
@@ -231,16 +303,16 @@ for (const mode of ['ok', 'fail', 'cancel'] as const)
           service.submit('s', id, signal, async () => input),
           /already has a saved/,
         )
-        assert.deepEqual(await service.list('other', signal), [])
+        assert.deepEqual(await service.list('other', signal), { results: [] })
         assert.deepEqual(await readdir(await service.store.root('s')), [id])
         const bad = randomUUID(),
           badDir = path.join(await service.store.root('s'), bad)
         await mkdir(badDir)
         await writeFile(path.join(badDir, 'result.json'), '{')
-        const reopened = await service.list('s', signal)
+        const { results: reopened } = await service.list('s', signal)
         assert.deepEqual(
-          reopened.map((g) => g.id),
-          [id, bad],
+          new Set(reopened.map((g) => g.id)),
+          new Set([id, bad]),
         )
         await service.store.remove('s', bad)
         await service.store.remove('s', id)
@@ -249,7 +321,7 @@ for (const mode of ['ok', 'fail', 'cancel'] as const)
         assert.deepEqual(planned, [convert.capability_id])
       }
       assert.deepEqual(await readdir(await service.store.root('s')), [])
-      assert.equal(service.active('s'), null)
+      assert.equal(await service.active('s'), null)
     } finally {
       await service.dispose()
       await rm(root, { recursive: true, force: true })

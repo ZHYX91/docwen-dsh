@@ -6,6 +6,7 @@ const [host, browser] = await Promise.all([
   build({
     entryPoints: ['src/host.ts'], outfile: 'dist/host.js', bundle: true, format: 'esm',
     platform: 'node', target: 'node24', metafile: true,
+    banner: { js: "import { createRequire as createBundledRequire } from 'node:module'; const require = createBundledRequire(import.meta.url);" },
   }),
   build({
     entryPoints: ['src/client.tsx'], bundle: true, format: 'cjs', platform: 'browser',

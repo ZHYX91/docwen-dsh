@@ -147,7 +147,7 @@ async function checkBrowser(host) {
           const response = await route.fetch({ timeout: 120000 })
           assert.ok(response.ok(), 'Real Core must complete before the response is dropped')
           assert.equal((await response.json()).id, taskId)
-          const durable = await (await host.request(host.uri('list'))).json()
+          const { results: durable } = await (await host.request(host.uri('list'))).json()
           assert.ok(durable.some(item => item.id === taskId))
           return route.abort('failed')
         }
@@ -170,7 +170,7 @@ async function checkBrowser(host) {
       await lost.getByText(/Completed/).waitFor()
       assert.equal(posts.length, 2, 'No second POST for the recovered row or the already completed row')
       assert.equal(reads, 2)
-      const durable = await (await host.request(host.uri('list'))).json()
+      const { results: durable } = await (await host.request(host.uri('list'))).json()
       assert.equal(durable.filter(item => posts.includes(item.id)).length, 2)
       const exact = await host.request(host.uri('result', {resultId: posts[0]}))
       assert.equal((await exact.json()).id, posts[0])

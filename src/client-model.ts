@@ -1,4 +1,5 @@
 import type { Result, ResultFile } from './documents.js'
+import { MAX_DOCUMENT, MAX_FILES_PER_TASK, MAX_RESULT } from './limits.js'
 
 export const EXPORT = 'convert.markdown_source.to_docx'
 export const IMPORT = 'convert.docx.to_markdown'
@@ -95,6 +96,9 @@ export function jobsFor(cap: Capability, items: Item[], options: Options): Job[]
   const linked = withResources(cap, items)
   const groups = linked ? [linked] : slot.max_items === 1 ? items.map(item => [item]) : [items]
   if (!linked && groups.some(group => slot.max_items !== undefined && group.length > slot.max_items)) return []
+  if (groups.some(group => group.length > MAX_FILES_PER_TASK ||
+    group.some(item => (item.bytes ?? 0) > MAX_DOCUMENT) ||
+    group.reduce((size, item) => size + (item.bytes ?? 0), 0) > MAX_RESULT)) return []
   return groups.map(inputs => ({ label: inputs.map(i => i.label).join(', '), status: 'queued',
     intent: { action: 'process', capabilityId: cap.capability_id, options, inputs } }))
 }
@@ -119,12 +123,15 @@ export function api(sessionId: string, action: string, fields: Record<string, st
   return 'api/docwen-dsh' + (upload ? '/upload' : '') + '?' + new URLSearchParams({ ...fields, sessionId, action })
 }
 export class HttpFailure extends Error {
-  constructor(message: string, readonly status: number) { super(message) }
+  constructor(message: string, readonly status: number, readonly code?: string) { super(message) }
 }
 export async function json<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init)
   const data = await response.json()
-  if (!response.ok) throw new HttpFailure(typeof data?.error === 'string' ? data.error : 'DocWen HTTP ' + response.status, response.status)
+  if (!response.ok) throw new HttpFailure(
+    typeof data?.error === 'string' ? data.error : 'DocWen HTTP ' + response.status, response.status,
+    typeof data?.code === 'string' ? data.code : undefined,
+  )
   return data as T
 }
 

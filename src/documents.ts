@@ -6,8 +6,8 @@ import { fromMarkdown } from 'mdast-util-from-markdown'
 import type { Nodes } from 'mdast'
 import { DOCX, MARKDOWN, object, objects, text, type Input } from './machine.js'
 
-export const MAX_DOCUMENT = 32 * 1024 * 1024
-export const MAX_RESULT = 96 * 1024 * 1024
+export { MAX_DOCUMENT, MAX_RESULT } from './limits.js'
+import { MAX_DOCUMENT, MAX_RESULT } from './limits.js'
 export {IMAGE_TYPES, IMAGE_MEDIA} from './media.js'
 export function hash(bytes: Uint8Array | string): string {
   return createHash('sha256').update(bytes).digest('hex')
@@ -141,6 +141,11 @@ export interface Result {
   warnings: string[]
   entries?: ResultEntry[]
   relations?: ResultRelation[]
+}
+
+export interface ResultPage {
+  results: Result[]
+  next?: string
 }
 
 const MAX_FILES = 1024

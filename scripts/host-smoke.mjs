@@ -261,14 +261,17 @@ export async function withInstalledHost(options, callback) {
 async function cancelPendingUpload(request, uri) {
   const taskId = randomUUID()
   const transport = new AbortController()
+  const boundary = 'docwen-' + randomUUID()
   const body = new ReadableStream({
     start(controller) {
-      controller.enqueue(new Uint8Array([0x50, 0x4b]))
+      controller.enqueue(new TextEncoder().encode(`--${boundary}\r\n` +
+        'Content-Disposition: form-data; name="file0"; filename="incomplete.docx"\r\n' +
+        `Content-Type: ${docxMedia}\r\n\r\nPK`))
     },
   })
-  const upload = request(uri('import', { filename: 'incomplete.docx', taskId }, true), {
+  const upload = request(uri('run', { taskId }, true), {
     method: 'POST',
-    headers: { 'content-type': docxMedia },
+    headers: { 'content-type': `multipart/form-data; boundary=${boundary}` },
     body,
     duplex: 'half',
     signal: transport.signal,
@@ -299,7 +302,7 @@ async function cancelPendingUpload(request, uri) {
     assert.equal(cancelled.ok, true)
     // The server must release the slot before the client closes the incomplete upload.
     await waitActive((active) => active === null)
-    const results = await (await checked(await request(uri('list')))).json()
+    const { results } = await (await checked(await request(uri('list')))).json()
     assert.ok(results.every((result) => result.id !== taskId))
   } finally {
     transport.abort()
@@ -346,7 +349,7 @@ async function verifyHost({
     assert.deepEqual(mediaDigests(await savedFile(fresh.id)).sort(), [...attachments, digest(thirdImage)].sort())
     assert.deepEqual(await savedFile(exported.id), docx, 'saved bytes do not follow workspace edits')
     const listIds = async () =>
-      (await (await checked(await request(uri('list')))).json()).map((row) => row.id).sort()
+      (await (await checked(await request(uri('list')))).json()).results.map((row) => row.id).sort()
     const ids = await listIds()
     await rm(fixtureImage)
     const failed = await exportReply()
@@ -358,12 +361,17 @@ async function verifyHost({
     await writeFile(fixtureImage, oldImage)
   }
   console.log('Saved Word bytes survive changes and deletion; re-export checks the current workspace image.')
+  const importForm = new FormData()
+  importForm.set('file0', new File([docx], 'historic-reply.docx', { type: docxMedia }))
+  importForm.set('intent', JSON.stringify({
+    action: 'process', capabilityId: 'convert.docx.to_markdown', sources: [{ kind: 'upload', field: 'file0' }],
+    options: { preserve_resources: true, image_mode: 'file', image_link_style: 'markdown_embed', recognize_text: false },
+  }))
   const imported = await (
     await checked(
-      await request(uri('import', { filename: 'historic-reply.docx' }, true), {
+      await request(uri('run', {}, true), {
         method: 'POST',
-        headers: { 'content-type': docxMedia },
-        body: docx,
+        body: importForm,
       }),
     )
   ).json()
@@ -376,7 +384,7 @@ async function verifyHost({
   const markdown = strFromU8(group[imported.files.find((it) => it.id === imported.primary).path])
   for (const image of imported.files.filter((it) => it.media.startsWith('image/')))
     assert.ok(markdown.includes(path.posix.basename(image.path)))
-  const reopened = await (await checked(await request(uri('list')))).json()
+  const { results: reopened } = await (await checked(await request(uri('list')))).json()
   assert.ok(reopened.some((item) => item.id === imported.id))
   assert.ok(reopened.some((item) => item.id === exported.id))
   const proofread = catalog.capabilities.find((cap) => cap.capability_id === 'validate.docx')
@@ -440,7 +448,7 @@ async function verifyHost({
   const [delivery] = split.deliveries
   assert.equal(delivery.turn, 3)
   assert.equal(delivery.count, 2)
-  const results = await (await checked(await request(uri('list')))).json()
+  const { results } = await (await checked(await request(uri('list')))).json()
   const splitResult = results.find((item) => item.files.length === 2 && item.files.every((file) => file.media === 'application/pdf'))
   assert.ok(splitResult, 'the complete split remains in Saved Results')
   const splitFiles = splitResult.entries.map((entry) => splitResult.files.find((file) => file.id === entry.artifact_id))

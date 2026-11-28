@@ -11,6 +11,7 @@ import {
   MAX_DOCUMENT,
   MAX_RESULT,
   portablePath,
+  readLimited,
   readResultFile,
   snapshot,
   type Result,
@@ -52,7 +53,9 @@ import {
   type ManagedProcess,
 } from './machine.js'
 import { fileMedia } from './media.js'
+import { MAX_FILES_PER_TASK, MAX_PREVIEW } from './limits.js'
 import { ResultStore, sessionKey, uuid } from './result-store.js'
+import type { StagedUpload } from './uploads.js'
 
 export interface TaskPorts {
   sessionQuery: { readSession(sessionId: string): Promise<{ events: Json[] } | undefined> }
@@ -69,7 +72,8 @@ export interface TaskPorts {
   }
 }
 type Scope = NonNullable<Awaited<ReturnType<WorkspaceFiles['scopeOf']>>>
-export type OpenInput = { intent: Json; uploads?: Map<string, File> }
+type Upload = File | StagedUpload
+export type OpenInput = { intent: Json; uploads?: Map<string, Upload> }
 interface Operation {
   id: string
   progress: number
@@ -77,7 +81,6 @@ interface Operation {
   done: Promise<Result>
 }
 export class Busy extends Error {}
-const maxInputs = 64
 
 function attachmentName(item: Admitted): string {
   const ref = item.attachment
@@ -90,6 +93,7 @@ function attachmentName(item: Admitted): string {
 
 export class DocumentTasks {
   private running = new Map<string, Operation>()
+  private awaitingExit = new Map<string, { id: string; error: UnconfirmedExit; work: string }>()
   private closing = new AbortController()
   private catalogs = new Map<string, { at: number; value: MachineCatalog }>()
   private probes = new Set<Promise<MachineCatalog>>()
@@ -141,15 +145,15 @@ export class DocumentTasks {
     this.catalogs.set(id, { at: Date.now(), value })
     if (this.catalogs.size > 16) this.catalogs.delete(this.catalogs.keys().next().value!)
   }
-  async list(id: string, signal: AbortSignal) {
+  async list(id: string, signal: AbortSignal, before?: string) {
     await this.scope(id, signal)
-    return this.store.list(id)
+    return this.store.list(id, signal, before)
   }
   async preview(id: string, messageId: string, signal: AbortSignal) {
     await this.scope(id, signal)
     const { markdown } = completedReply(await this.events(id), messageId)
-    if (Buffer.byteLength(markdown) > MAX_DOCUMENT)
-      throw new Error('The reply exceeds the document size limit.')
+    if (Buffer.byteLength(markdown) > MAX_PREVIEW)
+      throw new Error('The reply exceeds the 2 MiB preview limit.')
     return { markdown, images: imageTargets(markdown).map((image) => image.url) }
   }
   async attachments(id: string, signal: AbortSignal) {
@@ -168,7 +172,17 @@ export class DocumentTasks {
       }
     })
   }
-  active(id: string) {
+  private async confirmExit(id: string) {
+    const pending = this.awaitingExit.get(id)
+    if (pending && await pending.error.confirm() && this.awaitingExit.get(id) === pending) {
+      this.awaitingExit.delete(id)
+      await rm(pending.work, { recursive: true, force: true }).catch(() => undefined)
+    }
+  }
+  async active(id: string) {
+    await this.confirmExit(id)
+    const pending = this.awaitingExit.get(id)
+    if (pending) return { id: pending.id, phase: 'awaiting_exit' as const }
     const task = this.running.get(id)
     return task ? { id: task.id, progress: task.progress } : null
   }
@@ -221,12 +235,19 @@ export class DocumentTasks {
     id: string,
     taskId: string,
     caller: AbortSignal,
-    open: (signal: AbortSignal) => Promise<OpenInput>,
+    open: (signal: AbortSignal, stageUploads: () => Promise<string>) => Promise<OpenInput>,
     admitted: readonly Admitted[] = [],
   ): Promise<Result> {
     if (!sessionKey.test(id) || !uuid.test(taskId)) throw new Error('Invalid document task identity.')
+    if (this.awaitingExit.has(id) || this.running.size + this.awaitingExit.size >= 4)
+      await Promise.all([...this.awaitingExit.keys()].map(session => this.confirmExit(session)))
+    caller.throwIfAborted()
+    this.closing.signal.throwIfAborted()
+    const pending = this.awaitingExit.get(id)
+    if (pending) throw pending.error
     if (this.running.has(id)) throw new Busy('This conversation already has a running document task.')
-    if (this.running.size >= 4) throw new Busy('DocWen is busy. Try again after another task finishes.')
+    if (this.running.size + this.awaitingExit.size >= 4)
+      throw new Busy('DocWen is busy. Try again after another task finishes.')
     const control = new AbortController()
     const signal = AbortSignal.any([
       caller,
@@ -237,12 +258,18 @@ export class DocumentTasks {
     const done = this.scope(id, signal).then(async (scope) => {
       if (await this.store.exists(id, taskId))
         throw new Busy('This task already has a saved result. Reopen it from the session panel.')
-      const { intent, uploads } = await open(signal)
-      signal.throwIfAborted()
-      return this.execute(id, taskId, scope, intent, uploads ?? new Map(), admitted, signal, (n) => {
-        const task = this.running.get(id)
-        if (task) task.progress = Math.max(task.progress, Math.min(99, n))
-      })
+      let uploadRoot: Promise<string> | undefined
+      try {
+        const { intent, uploads } = await open(signal, () => uploadRoot ??= this.store.staging(id))
+        signal.throwIfAborted()
+        return await this.execute(id, taskId, scope, intent, uploads ?? new Map(), admitted, signal, (n) => {
+          const task = this.running.get(id)
+          if (task) task.progress = Math.max(task.progress, Math.min(99, n))
+        })
+      } finally {
+        const directory = await uploadRoot?.catch(() => undefined)
+        if (directory) await rm(directory, { recursive: true, force: true }).catch(() => undefined)
+      }
     })
     this.running.set(id, { id: taskId, progress: 0, control, done })
     try {
@@ -255,7 +282,7 @@ export class DocumentTasks {
   private async loadSource(
     scope: Scope,
     desc: Json,
-    uploads: Map<string, File>,
+    uploads: Map<string, Upload>,
     admitted: readonly Admitted[],
     signal: AbortSignal,
     limit = MAX_DOCUMENT,
@@ -274,7 +301,8 @@ export class DocumentTasks {
       name = portablePath(file.name)
       if (name.includes('/')) throw new Error('An uploaded filename must be a basename.')
       media = mediaFor(name)
-      bytes = new Uint8Array(await file.arrayBuffer())
+      bytes = file instanceof File ? new Uint8Array(await file.arrayBuffer()) : await readLimited(file.path, limit, signal)
+      if (bytes.byteLength !== file.size) throw new Error('The selected upload changed size.')
     } else if (desc.kind === 'result') {
       const result = await this.store.read(
         scope.sessionId,
@@ -325,14 +353,14 @@ export class DocumentTasks {
     if (!['workspace', 'attachment'].includes(String(desc.kind))) throw new Error('Invalid preview source.')
     const scope = await this.scope(id, signal)
     const items = desc.kind === 'attachment' ? visibleAttachments(await this.events(id)) : []
-    return this.loadSource(scope, desc, new Map(), items, signal, 2 * 1024 * 1024)
+    return this.loadSource(scope, desc, new Map(), items, signal, MAX_PREVIEW)
   }
 
   private async replySources(id: string, scope: Scope, ids: unknown, signal: AbortSignal) {
     if (
       !Array.isArray(ids) ||
       ids.length < 1 ||
-      ids.length > maxInputs ||
+      ids.length > MAX_FILES_PER_TASK ||
       ids.some((m) => typeof m !== 'string' || !sessionKey.test(m)) ||
       new Set(ids).size !== ids.length
     )
@@ -463,7 +491,7 @@ export class DocumentTasks {
     taskId: string,
     scope: Scope,
     intent: Json,
-    uploads: Map<string, File>,
+    uploads: Map<string, Upload>,
     admitted: readonly Admitted[],
     signal: AbortSignal,
     progress: (n: number) => void,
@@ -498,7 +526,8 @@ export class DocumentTasks {
         label = (intent.messageIds as string[]).length === 1 ? 'Conversation reply' : 'Conversation replies'
       } else {
         const raw = objects(intent.sources)
-        if (!raw.length || raw.length > maxInputs) throw new Error('Choose between 1 and 64 input files.')
+        if (!raw.length || raw.length > MAX_FILES_PER_TASK)
+          throw new Error(`Choose between 1 and ${MAX_FILES_PER_TASK} input files.`)
         const refs = raw.some((s) => s.kind === 'attachment')
           ? [...admitted, ...visibleAttachments(await this.events(id))]
           : []
@@ -624,7 +653,10 @@ export class DocumentTasks {
       await this.store.publish(id, output, result, signal)
       return result
     } catch (error) {
-      if (error instanceof UnconfirmedExit) clean = false
+      if (error instanceof UnconfirmedExit) {
+        clean = false
+        this.awaitingExit.set(id, { id: taskId, error, work })
+      }
       throw error
     } finally {
       if (clean) await rm(work, { recursive: true, force: true }).catch(() => undefined)
