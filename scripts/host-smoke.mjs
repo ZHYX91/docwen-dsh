@@ -14,6 +14,8 @@ const exec = promisify(execFile)
 const project = fileURLToPath(new URL('..', import.meta.url))
 const bluePng =
   'iVBORw0KGgoAAAANSUhEUgAAAAYAAAAGCAIAAABvrngfAAAAFElEQVR4nGNkYPjPgAqYGDAANYUAca8BC7fe9+IAAAAASUVORK5CYII='
+const greenPng =
+  'iVBORw0KGgoAAAANSUhEUgAAAAYAAAAGCAIAAABvrngfAAAAE0lEQVR4nGNk+M+ABpjQBagrBAByrgELM2WLhgAAAABJRU5ErkJggg=='
 const docxMedia = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
 
 function twoPagePdf() {
@@ -317,6 +319,45 @@ async function verifyHost({
   catalog,
 }) {
   const docx = await readFile(docxPath)
+  const template =
+    catalog.templates.find((it) => it.target === 'docx' && it.is_default === true) ??
+    catalog.templates.find((it) => it.target === 'docx')
+  const exportReply = () => request(uri('run'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ action: 'export', messageIds: [messageId], options: { template_name: template.id } }),
+  })
+  const savedFile = async (id) =>
+    Buffer.from(await (await checked(await request(uri('file', { resultId: id })))).arrayBuffer())
+  const mediaDigests = (bytes) =>
+    Object.entries(unzipSync(bytes)).filter(([name]) => name.startsWith('word/media/'))
+      .map(([, image]) => createHash('sha256').update(image).digest('hex'))
+  const fixtureImage = path.join(workspace, 'figure.png')
+  const oldImage = await readFile(fixtureImage)
+  const thirdImage = Buffer.from(greenPng, 'base64')
+  const digest = (bytes) => createHash('sha256').update(bytes).digest('hex')
+  const oldMedia = mediaDigests(docx)
+  const attachments = oldMedia.filter((sha) => sha !== digest(oldImage))
+  assert.equal(attachments.length, 1, 'identify the original independent session attachment')
+  try {
+    await writeFile(fixtureImage, thirdImage)
+    const fresh = await (await checked(await exportReply())).json()
+    assert.notEqual(fresh.id, exported.id)
+    assert.deepEqual(mediaDigests(await savedFile(fresh.id)).sort(), [...attachments, digest(thirdImage)].sort())
+    assert.deepEqual(await savedFile(exported.id), docx, 'saved bytes do not follow workspace edits')
+    const listIds = async () =>
+      (await (await checked(await request(uri('list')))).json()).map((row) => row.id).sort()
+    const ids = await listIds()
+    await rm(fixtureImage)
+    const failed = await exportReply()
+    assert.equal(failed.ok, false, 'missing required image cannot generate a new export')
+    assert.match((await failed.json()).error, /Cannot read the referenced image: figure.png/u)
+    assert.deepEqual(await listIds(), ids, 'failure does not publish any result')
+    assert.deepEqual(await savedFile(exported.id), docx, 'old saved bytes remain downloadable without the image')
+  } finally {
+    await writeFile(fixtureImage, oldImage)
+  }
+  console.log('Saved Word bytes survive changes and deletion; re-export checks the current workspace image.')
   const imported = await (
     await checked(
       await request(uri('import', { filename: 'historic-reply.docx' }, true), {
